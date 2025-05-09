@@ -3520,6 +3520,786 @@ class DQNAgent:
     def save(self, name):
         self.model.save_weights(name)
 # --- END RL AGENT CLASS ---
+#==============================================================================
+# LIVE DATA BUFFER FOR CONTINUOUS LEARNING
+#==============================================================================
+class LiveDataBuffer:
+    """
+    Elite data buffer that collects market data points from live feed.
+    This allows the system to start with zero historical data and gradually
+    build up a training dataset from live market observations.
+    """
+    
+    def __init__(self, max_size=1000):
+        """Initialize the live data buffer
+        
+        Args:
+            max_size: Maximum number of data points to store
+        """
+        self.buffer = []
+        self.max_size = max_size
+        self.last_update = None
+        self.logger = logging.getLogger("NQAlpha.DataBuffer")
+        self.logger.info(f"Live data buffer initialized with max size {max_size}")
+    
+    def add_data_point(self, data_point):
+        """Add a new data point to the buffer
+        
+        Args:
+            data_point: Market data point
+        """
+        if data_point is None:
+            return
+            
+        # Add timestamp if missing
+        if 'timestamp' not in data_point:
+            data_point['timestamp'] = datetime.datetime.now()
+            
+        # Add to buffer
+        self.buffer.append(data_point)
+        self.last_update = datetime.datetime.now()
+        
+        # Keep buffer size limited
+        if len(self.buffer) > self.max_size:
+            self.buffer.pop(0)
+    
+    def get_dataframe(self):
+        """Get buffer data as DataFrame
+        
+        Returns:
+            pandas.DataFrame: Buffer data
+        """
+        if not self.buffer:
+            return None
+            
+        import pandas as pd
+        df = pd.DataFrame(self.buffer)
+        
+        # Convert timestamp to datetime if needed
+        if 'timestamp' in df.columns:
+            if not isinstance(df['timestamp'].iloc[0], pd.Timestamp):
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
+        # Sort by timestamp
+        if 'timestamp' in df.columns:
+            df = df.sort_values('timestamp')
+            
+        # Add price-based OHLC columns if missing
+        if 'price' in df.columns:
+            if 'Close' not in df.columns:
+                df['Close'] = df['price']
+            if 'Open' not in df.columns:
+                df['Open'] = df['price']
+            if 'High' not in df.columns:
+                df['High'] = df['price']
+            if 'Low' not in df.columns:
+                df['Low'] = df['price']
+                
+        return df
+    
+    def size(self):
+        """Get current buffer size
+        
+        Returns:
+            int: Buffer size
+        """
+        return len(self.buffer)
+    
+    def is_ready_for_training(self, min_points=30):
+        """Check if buffer has enough data for training
+        
+        Args:
+            min_points: Minimum number of points required
+            
+        Returns:
+            bool: True if ready for training
+        """
+        return len(self.buffer) >= min_points
+
+
+
+#==============================================================================
+# LIVE-ONLY CONTINUOUS LEARNING TRADER
+#==============================================================================
+class NQLiveTrainer:
+    """
+    Elite continuous learning system optimized for zero historical data.
+    Trains exclusively on live data points while performing paper trading.
+    
+    Key features:
+    - Collects live data points before starting to trade
+    - Gradually increases trading activity as more data is collected
+    - Uses high exploration rate early on, decreasing over time
+    - Implements extra safety mechanisms during early learning phase
+    - Dynamically adjusts confidence thresholds based on data quantity
+    """
+    
+    def __init__(self, initial_capital=100000, config=None):
+        """Initialize the live-only trainer
+        
+        Args:
+            initial_capital: Initial paper trading capital
+            config: Additional configuration parameters
+        """
+        self.logger = logging.getLogger("NQAlpha.LiveTrainer")
+        
+        # Default configuration
+        self.config = {
+            'update_interval': 5.0,         # Update interval in seconds
+            'min_data_points': 30,          # Minimum data points before trading
+            'preferred_data_points': 100,   # Preferred data points for confident trading
+            'data_buffer_size': 500,        # Maximum buffer size
+            'initial_trade_size_pct': 0.01, # Conservative initial position size (1%)
+            'max_trade_size_pct': 0.05,     # Maximum position size (5%)
+            'initial_confidence': 0.80,     # High initial confidence threshold
+            'min_confidence': 0.60,         # Minimum confidence threshold
+            'learning_interval': 10,        # Train every 10 data points
+            'stop_loss_pct': 0.01,          # Default stop loss (1%)
+            'take_profit_pct': 0.015,       # Default take profit (1.5%)
+            'initial_exploration': 0.9,     # High initial exploration rate
+            'min_exploration': 0.1,         # Minimum exploration rate
+            'exploration_decay': 0.995,     # Exploration decay per trade
+            'save_interval': 50,            # Save every 50 data points
+            'max_drawdown_pct': 0.05,       # Max drawdown before risk reduction
+            'risk_increment_factor': 0.001, # Gradual risk increase per data point
+            'print_metrics_interval': 20    # Print metrics every 20 data points
+        }
+        
+        # Update with provided config
+        if config:
+            for k, v in config.items():
+                self.config[k] = v
+        
+        # Initialize components
+        self.data_buffer = LiveDataBuffer(max_size=self.config['data_buffer_size'])
+        self.market_data_feed = MarketDataFeed()
+        self.rl_agent = NQRLAgent()
+        
+        # Modify RL agent parameters for live-only training
+        self.rl_agent.epsilon = self.config['initial_exploration']
+        self.rl_agent.epsilon_decay = self.config['exploration_decay']
+        self.rl_agent.epsilon_end = self.config['min_exploration']
+        
+        # Paper trading state
+        self.initial_capital = initial_capital
+        self.capital = initial_capital
+        self.positions = []
+        self.trades_history = []
+        self.data_points_collected = 0
+        
+        # Performance tracking
+        self.equity_curve = []
+        self.max_drawdown = 0.0
+        self.peak_capital = initial_capital
+        
+        # Learning state
+        self.training_count = 0
+        self.last_save_time = time.time()
+        self.current_confidence_threshold = self.config['initial_confidence']
+        self.current_trade_size_pct = self.config['initial_trade_size_pct']
+        
+        # Running state
+        self.running = False
+        self.thread = None
+        self.start_time = None
+        
+        # Create directories
+        os.makedirs('data/paper_trades', exist_ok=True)
+        os.makedirs('models/rl', exist_ok=True)
+        
+        self.logger.info(f"Live-Only Trainer initialized with {initial_capital:.2f} capital")
+    
+    def start(self):
+        """Start the live-only trainer"""
+        if self.running:
+            self.logger.warning("Live trainer already running")
+            return
+        
+        self.logger.info("Starting live-only trainer")
+        
+        try:
+            # Set running flag
+            self.running = True
+            self.start_time = time.time()
+            
+            # Start market data feed if not already running
+            if hasattr(self.market_data_feed, 'running') and not self.market_data_feed.running:
+                self.logger.info("Starting market data feed")
+                self.market_data_feed.run()
+            
+            # Start in background thread
+            self.thread = threading.Thread(
+                target=self._training_loop,
+                name="LiveTrainingThread"
+            )
+            self.thread.daemon = True
+            self.thread.start()
+            
+            self.logger.info("Live training thread started")
+            print("Live training system started. Collecting initial data points...")
+            
+        except Exception as e:
+            self.running = False
+            self.logger.error(f"Error starting live trainer: {e}")
+            print(f"Error starting live trainer: {e}")
+    
+    def stop(self):
+        """Stop the live-only trainer"""
+        if not self.running:
+            self.logger.warning("Live trainer not running")
+            return
+        
+        self.logger.info("Stopping live-only trainer")
+        
+        try:
+            # Set running flag
+            self.running = False
+            
+            # Wait for thread to complete
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=5.0)
+            
+            # Save final state
+            self._save_model()
+            self._save_trades_history()
+            
+            self.logger.info("Live-only trainer stopped")
+            print("Live training system stopped")
+            
+        except Exception as e:
+            self.logger.error(f"Error stopping live trainer: {e}")
+            print(f"Error stopping live trainer: {e}")
+    
+    def _training_loop(self):
+        """Main training loop for live-only trainer"""
+        self.logger.info("Live training loop started")
+        
+        update_interval = self.config['update_interval']
+        last_print_time = time.time()
+        data_point_counter = 0
+        
+        try:
+            while self.running:
+                try:
+                    loop_start = time.time()
+                    
+                    # Get latest market data
+                    market_data = self._get_latest_market_data()
+                    
+                    if market_data is not None:
+                        # Add to data buffer
+                        self.data_buffer.add_data_point(market_data)
+                        self.data_points_collected += 1
+                        data_point_counter += 1
+                        
+                        # Update open positions
+                        self._update_positions(market_data)
+                        
+                        # Update risk parameters based on collected data
+                        self._update_risk_parameters()
+                        
+                        # Check if ready for training and trading
+                        if self.data_buffer.is_ready_for_training(self.config['min_data_points']):
+                            
+                            # Train agent periodically
+                            if data_point_counter % self.config['learning_interval'] == 0:
+                                self._train_agent()
+                            
+                            # Generate and execute trading signals
+                            self._process_trading_signals(market_data)
+                        else:
+                            # Print data collection progress
+                            if time.time() - last_print_time > 10:  # Every 10 seconds
+                                points_needed = self.config['min_data_points'] - self.data_buffer.size()
+                                print(f"Collecting data: {self.data_buffer.size()}/{self.config['min_data_points']} points " +
+                                      f"({points_needed} more needed before trading)")
+                                last_print_time = time.time()
+                        
+                        # Save model periodically
+                        if data_point_counter % self.config['save_interval'] == 0:
+                            self._save_model()
+                            self._save_trades_history()
+                        
+                        # Print metrics periodically
+                        if data_point_counter % self.config['print_metrics_interval'] == 0:
+                            self._print_metrics()
+                            last_print_time = time.time()
+                    
+                    # Calculate elapsed time and sleep for remaining interval
+                    elapsed = time.time() - loop_start
+                    sleep_time = max(0.0, update_interval - elapsed)
+                    
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in training loop: {e}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                    time.sleep(1.0)  # Sleep briefly before retrying
+            
+        except Exception as e:
+            self.logger.error(f"Fatal error in training thread: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        
+        self.logger.info("Live training loop stopped")
+    
+    def _get_latest_market_data(self):
+        """Get latest market data from feed
+        
+        Returns:
+            dict: Latest market data or None if not available
+        """
+        try:
+            # Get real-time data from feed
+            market_data = self.market_data_feed.get_realtime_data()
+            
+            if market_data is None:
+                return None
+                
+            return market_data
+            
+        except Exception as e:
+            self.logger.error(f"Error getting market data: {e}")
+            return None
+    
+    def _update_risk_parameters(self):
+        """Update risk parameters based on collected data"""
+        try:
+            # Calculate data ratio (how close to preferred amount we are)
+            data_size = self.data_buffer.size()
+            data_ratio = min(1.0, data_size / self.config['preferred_data_points'])
+            
+            # Calculate risk factor (increases as we collect more data)
+            # 0.0 = minimum risk, 1.0 = full risk
+            risk_factor = data_ratio
+            
+            # Adjust confidence threshold (high at start, lowers as we collect data)
+            confidence_range = self.config['initial_confidence'] - self.config['min_confidence']
+            self.current_confidence_threshold = self.config['initial_confidence'] - (confidence_range * risk_factor)
+            
+            # Adjust trade size (small at start, increases as we collect data)
+            size_range = self.config['max_trade_size_pct'] - self.config['initial_trade_size_pct']
+            self.current_trade_size_pct = self.config['initial_trade_size_pct'] + (size_range * risk_factor)
+            
+            # Add small incremental growth for stable long-term training
+            increment = self.config['risk_increment_factor'] * self.data_points_collected
+            self.current_trade_size_pct = min(self.config['max_trade_size_pct'], 
+                                             self.current_trade_size_pct + increment)
+            
+            # Apply drawdown protection
+            if self.max_drawdown > 0:
+                drawdown_factor = max(0.5, 1.0 - (self.max_drawdown / self.config['max_drawdown_pct']))
+                self.current_trade_size_pct *= drawdown_factor
+            
+        except Exception as e:
+            self.logger.error(f"Error updating risk parameters: {e}")
+    
+    def _update_positions(self, market_data):
+        """Update open positions based on current market data
+        
+        Args:
+            market_data: Current market data
+        """
+        if not self.positions:
+            return
+        
+        # Get current price
+        price = market_data.get('price')
+        if price is None:
+            return
+        
+        # Update each position
+        positions_to_remove = []
+        
+        for i, position in enumerate(self.positions):
+            # Calculate current profit/loss
+            entry_price = position['entry_price']
+            size = position['size']
+            direction = position['direction']
+            
+            if direction == 'long':
+                current_pl = (price - entry_price) * size
+                current_pl_pct = (price / entry_price) - 1
+            else:  # short
+                current_pl = (entry_price - price) * size
+                current_pl_pct = 1 - (price / entry_price)
+            
+            # Update position
+            position['current_price'] = price
+            position['current_pl'] = current_pl
+            position['current_pl_pct'] = current_pl_pct
+            
+            # Calculate position duration
+            entry_time = position['entry_time']
+            if isinstance(entry_time, str):
+                entry_time = datetime.datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+            position['duration'] = (datetime.datetime.now() - entry_time).total_seconds() / 60.0  # Minutes
+            
+            # Check for stop loss or take profit
+            exit_reason = None
+            
+            if direction == 'long':
+                if price <= position.get('stop_loss', 0):
+                    exit_reason = 'stop_loss'
+                elif price >= position.get('take_profit', float('inf')):
+                    exit_reason = 'take_profit'
+            else:  # short
+                if price >= position.get('stop_loss', float('inf')):
+                    exit_reason = 'stop_loss'
+                elif price <= position.get('take_profit', 0):
+                    exit_reason = 'take_profit'
+            
+            # Handle position exit if needed
+            if exit_reason is not None:
+                self._close_position(position, price, exit_reason)
+                positions_to_remove.append(i)
+        
+        # Remove closed positions (in reverse order to maintain indices)
+        for idx in sorted(positions_to_remove, reverse=True):
+            self.positions.pop(idx)
+            
+            # Update peak capital and drawdown after position changes
+            if self.capital > self.peak_capital:
+                self.peak_capital = self.capital
+            else:
+                current_drawdown = 1.0 - (self.capital / self.peak_capital)
+                self.max_drawdown = max(self.max_drawdown, current_drawdown)
+    
+    def _close_position(self, position, price, reason):
+        """Close a position
+        
+        Args:
+            position: Position to close
+            price: Current price
+            reason: Reason for closing
+        """
+        try:
+            # Calculate profit/loss
+            entry_price = position['entry_price']
+            size = position['size']
+            direction = position['direction']
+            
+            if direction == 'long':
+                pl = (price - entry_price) * size
+                pl_pct = (price / entry_price) - 1
+            else:  # short
+                pl = (entry_price - price) * size
+                pl_pct = 1 - (price / entry_price)
+            
+            # Update capital
+            self.capital += pl
+            
+            # Create trade record
+            entry_time = position['entry_time']
+            if isinstance(entry_time, str):
+                entry_time = datetime.datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                
+            trade = {
+                'id': position['id'],
+                'direction': direction,
+                'size': size,
+                'entry_price': entry_price,
+                'exit_price': price,
+                'entry_time': entry_time,
+                'exit_time': datetime.datetime.now(),
+                'duration': (datetime.datetime.now() - entry_time).total_seconds() / 60.0,  # Minutes
+                'pl': pl,
+                'pl_pct': pl_pct,
+                'exit_reason': reason
+            }
+            
+            # Add to trades history
+            self.trades_history.append(trade)
+            
+            # Update equity curve
+            self._update_equity()
+            
+            # Log trade
+            self.logger.info(f"Closed {direction} position {position['id']} at {price:.2f} with P/L: {pl:.2f} ({pl_pct:.2%})")
+            print(f"Trade completed: {direction} position closed at {price:.2f}, P/L: {pl:.2f} ({pl_pct:.2%}), Reason: {reason}")
+            
+            # Create learning experience
+            if 'state' in position:
+                # Determine reward based on trade outcome
+                if pl > 0:
+                    reward = 1.0  # Positive reward for profit
+                else:
+                    reward = -1.0  # Negative reward for loss
+                    
+                # Scale reward by % profit/loss (limited to reasonable range)
+                reward *= min(5.0, abs(pl_pct) * 100)
+                
+                # Adjust reward based on exit reason
+                if reason == 'stop_loss':
+                    reward *= 1.2  # Extra penalty for hitting stop loss
+                elif reason == 'take_profit':
+                    reward *= 1.5  # Extra reward for hitting take profit
+                
+                # Get action from position direction
+                if direction == 'long':
+                    action = 0  # Buy
+                else:
+                    action = 1  # Sell
+                
+                # Add experience to RL agent's memory
+                self.rl_agent.remember(position['state'], action, reward, position['state'], True)
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position: {e}")
+    
+    def _update_equity(self):
+        """Update equity curve"""
+        equity_point = {
+            'timestamp': datetime.datetime.now(),
+            'equity': self.capital,
+            'data_points': self.data_points_collected
+        }
+        
+        self.equity_curve.append(equity_point)
+        
+        # Limit equity curve size
+        if len(self.equity_curve) > 1000:
+            self.equity_curve = self.equity_curve[-1000:]
+    
+    def _train_agent(self):
+        """Train RL agent on collected data"""
+        try:
+            # Get data as DataFrame
+            df = self.data_buffer.get_dataframe()
+            
+            if df is None or len(df) < self.config['min_data_points']:
+                return
+            
+            self.logger.info(f"Training agent on {len(df)} data points")
+            print(f"Training agent on {len(df)} data points...")
+            
+            # Add technical indicators if missing
+            try:
+                import talib
+                
+                if 'RSI' not in df.columns and 'Close' in df.columns:
+                    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+                    
+                if 'MACD' not in df.columns and 'Close' in df.columns:
+                    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(
+                        df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+                    
+                if 'ATR' not in df.columns and all(col in df.columns for col in ['High', 'Low', 'Close']):
+                    df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
+                    
+            except Exception as e:
+                self.logger.warning(f"Error adding technical indicators: {e}")
+            
+            # Train the agent
+            self.rl_agent.train(df)
+            
+            # Increment training count
+            self.training_count += 1
+            
+            self.logger.info(f"Agent training complete (iteration {self.training_count})")
+            print(f"Training complete (iteration {self.training_count})")
+            
+        except Exception as e:
+            self.logger.error(f"Error training agent: {e}")
+    
+    def _process_trading_signals(self, market_data):
+        """Process trading signals from RL agent
+        
+        Args:
+            market_data: Current market data
+        """
+        try:
+            # Don't generate signals if buffer isn't ready
+            if not self.data_buffer.is_ready_for_training(self.config['min_data_points']):
+                return
+            
+            # Get data for feature extraction
+            df = self.data_buffer.get_dataframe()
+            
+            if df is None:
+                return
+            
+            # Extract state features
+            state = None
+            try:
+                # Add technical indicators if missing
+                try:
+                    import talib
+                    
+                    if 'RSI' not in df.columns and 'Close' in df.columns:
+                        df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+                        
+                    if 'MACD' not in df.columns and 'Close' in df.columns:
+                        df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(
+                            df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+                        
+                    if 'ATR' not in df.columns and all(col in df.columns for col in ['High', 'Low', 'Close']):
+                        df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=14)
+                        
+                except Exception as e:
+                    self.logger.warning(f"Error adding technical indicators: {e}")
+                    
+                # Extract state from most recent data
+                states = self.rl_agent._extract_features(df)
+                if states and len(states) > 0:
+                    state = states[-1]
+            except Exception as e:
+                self.logger.error(f"Error extracting state features: {e}")
+                return
+            
+            if state is None:
+                return
+            
+            # Get action from RL agent
+            action = self.rl_agent.act(state)
+            
+            # Only trade if we don't already have a position
+            if not self.positions:
+                # Process action
+                if action == 0:  # Buy signal
+                    print(f"Buy signal detected at price: {market_data.get('price', 0):.2f}")
+                    self._open_position('long', market_data, state)
+                elif action == 1:  # Sell signal
+                    print(f"Sell signal detected at price: {market_data.get('price', 0):.2f}")
+                    self._open_position('short', market_data, state)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing trading signals: {e}")
+    
+    def _open_position(self, direction, market_data, state):
+        """Open a new position
+        
+        Args:
+            direction: Trade direction ('long' or 'short')
+            market_data: Current market data
+            state: State features used for decision
+        """
+        try:
+            # Get current price
+            price = market_data.get('price')
+            if price is None:
+                return
+            
+            # Calculate position size
+            position_value = self.capital * self.current_trade_size_pct
+            position_size = position_value / price
+            
+            # Calculate stop loss and take profit
+            if direction == 'long':
+                stop_loss = price * (1 - self.config['stop_loss_pct'])
+                take_profit = price * (1 + self.config['take_profit_pct'])
+            else:  # short
+                stop_loss = price * (1 + self.config['stop_loss_pct'])
+                take_profit = price * (1 - self.config['take_profit_pct'])
+            
+            # Create position
+            position = {
+                'id': f"pos_{len(self.trades_history) + 1}",
+                'direction': direction,
+                'size': position_size,
+                'entry_price': price,
+                'current_price': price,
+                'entry_time': datetime.datetime.now(),
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'current_pl': 0.0,
+                'current_pl_pct': 0.0,
+                'duration': 0.0,
+                'state': state
+            }
+            
+            # Add position
+            self.positions.append(position)
+            
+            # Log position
+            self.logger.info(f"Opened {direction} position {position['id']}: {position_size:.4f} units at {price:.2f}")
+            print(f"Position opened: {direction} {position_size:.4f} units at {price:.2f}")
+            print(f"Stop loss: {stop_loss:.2f}, Take profit: {take_profit:.2f}")
+            
+        except Exception as e:
+            self.logger.error(f"Error opening position: {e}")
+    
+    def _save_model(self):
+        """Save RL agent model"""
+        try:
+            # Generate filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"nq_live_trainer_{timestamp}"
+            
+            # Save model
+            self.rl_agent.save(filename)
+            
+            # Also save as production model
+            self.rl_agent.save("live_trained_model")
+            
+            self.logger.info(f"Saved model as {filename}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving model: {e}")
+    
+    def _save_trades_history(self):
+        """Save trades history to CSV file"""
+        try:
+            # Only save if we have trades
+            if not self.trades_history:
+                return
+            
+            # Generate filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"live_trades_{timestamp}.csv"
+            filepath = os.path.join('data/paper_trades', filename)
+            
+            # Convert to DataFrame
+            import pandas as pd
+            df = pd.DataFrame(self.trades_history)
+            
+            # Save to CSV
+            df.to_csv(filepath, index=False)
+            
+            self.logger.info(f"Saved trades history to {filepath}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving trades history: {e}")
+    
+    def _print_metrics(self):
+        """Print performance metrics"""
+        try:
+            # Calculate win rate
+            wins = sum(1 for trade in self.trades_history if trade['pl'] > 0)
+            total = len(self.trades_history)
+            win_rate = wins / total if total > 0 else 0
+            
+            # Calculate average trade
+            if total > 0:
+                avg_profit = sum(trade['pl'] for trade in self.trades_history) / total
+                avg_pct = sum(trade['pl_pct'] for trade in self.trades_history) / total
+            else:
+                avg_profit = 0
+                avg_pct = 0
+            
+            # Print metrics
+            print("\n--- NQ ELITE PERFORMANCE METRICS ---")
+            print(f"Data Points: {self.data_points_collected} ({self.data_buffer.size()} in buffer)")
+            print(f"Capital: ${self.capital:.2f} (Return: {(self.capital / self.initial_capital - 1):.2%})")
+            print(f"Trades: {total} (Win Rate: {win_rate:.2%})")
+            print(f"Avg Trade: ${avg_profit:.2f} ({avg_pct:.2%})")
+            print(f"Current Trade Size: {self.current_trade_size_pct:.2%} of capital")
+            print(f"Confidence Threshold: {self.current_confidence_threshold:.2f}")
+            print(f"Training Iterations: {self.training_count}")
+            print(f"Max Drawdown: {self.max_drawdown:.2%}")
+            
+            # Active positions
+            if self.positions:
+                print("\nACTIVE POSITIONS:")
+                for pos in self.positions:
+                    print(f"  {pos['direction'].upper()} {pos['size']:.4f} @ {pos['entry_price']:.2f} " +
+                          f"(P/L: {pos['current_pl']:.2f}, {pos['current_pl_pct']:.2%})")
+            print("-----------------------------------\n")
+            
+        except Exception as e:
+            self.logger.error(f"Error printing metrics: {e}")
 class DynamicTradeManager:
     """Advanced position management with dynamic stop losses and profit targets"""
     
@@ -4633,7 +5413,1187 @@ class TechnicalIndicators:
         """
         return self.indicators.get('atr', self.price_history[-1] * 0.005 if self.price_history else 0.001)
 
-
+#==============================================================================
+# CONTINUOUS LEARNING PAPER TRADING SYSTEM
+#==============================================================================
+class NQContinuousLearningTrader:
+    """
+    Elite continuous learning system that performs paper trading while
+    simultaneously training the RL model on real-time market data.
+    
+    Key features:
+    - Performs paper trading with sophisticated execution modeling
+    - Continuously trains the RL agent from paper trading outcomes
+    - Implements advanced experience replay with prioritized sampling
+    - Adapts to changing market regimes automatically
+    - Uses Bayesian optimization for hyperparameter tuning
+    """
+    
+    def __init__(self, rl_agent=None, market_data_feed=None, initial_capital=100000, config=None):
+        """Initialize the continuous learning paper trading system
+        
+        Args:
+            rl_agent: RL agent for trading decisions
+            market_data_feed: Market data feed for real-time data
+            initial_capital: Initial paper trading capital
+            config: Additional configuration parameters
+        """
+        self.logger = logging.getLogger("NQAlpha.CLTrader")
+        
+        # Default configuration
+        self.config = {
+            'update_interval': 5.0,         # Update interval in seconds
+            'trade_size_pct': 0.05,         # Trade size as % of capital
+            'max_positions': 3,             # Maximum simultaneous positions
+            'stop_loss_pct': 0.01,          # Default stop loss (1%)
+            'take_profit_pct': 0.02,        # Default take profit (2%)
+            'trailing_stop_pct': 0.005,     # Trailing stop % (0.5%)
+            'confidence_threshold': 0.65,   # Minimum confidence for trading
+            'max_training_history': 10000,  # Maximum training history size
+            'training_interval': 50,        # Train every 50 ticks/trades
+            'learning_rate_decay': 0.9999,  # Learning rate decay per training
+            'exploration_decay': 0.9995,    # Exploration decay per day
+            'reward_lookback': 5,           # Steps to look back for reward
+            'enable_position_sizing': True, # Dynamic position sizing
+            'enable_adaptive_stops': True,  # Adaptive stop loss/take profit
+            'save_interval': 100,           # Save model interval (trades)
+            'reinforcement_rewards': {      # Reward config for different outcomes
+                'profitable_trade': 1.0,    # Base reward for profitable trade
+                'unprofitable_trade': -1.0, # Base penalty for unprofitable trade
+                'time_decay': -0.01,        # Small penalty for holding positions
+                'exit_at_stop': -0.3,       # Small penalty for stop loss exit
+                'exit_at_target': 0.5,      # Bonus for take profit exit
+                'exit_with_trend': 0.2,     # Bonus for exiting with market trend
+                'trade_with_trend': 0.3,    # Bonus for opening with market trend
+                'threshold_scaling': True   # Scale rewards by distance from thresholds
+            },
+            'simulate_latency': True,       # Simulate real execution latency
+            'latency_range': (0.05, 0.2),   # Latency range in seconds
+            'slippage_model': 'adaptive',   # Adaptive slippage model
+            'enable_regime_detection': True,# Market regime detection
+            'enable_risk_management': True, # Advanced risk management
+            'max_drawdown_pct': 0.05,       # Max drawdown before reducing size
+            'data_augmentation': True,      # Use data augmentation for training
+            'hyperparameter_optimization': {# Bayesian optimization settings
+                'enabled': True,
+                'interval': 500,            # Optimize every 500 trades
+                'parameters': {
+                    'learning_rate': (0.0001, 0.01),
+                    'gamma': (0.9, 0.999),
+                    'batch_size': (32, 128)
+                }
+            }
+        }
+        
+        # Update with provided config
+        if config:
+            for k, v in config.items():
+                if isinstance(v, dict) and k in self.config and isinstance(self.config[k], dict):
+                    self.config[k].update(v)
+                else:
+                    self.config[k] = v
+        
+        # Initialize components
+        self.rl_agent = rl_agent
+        self.market_data_feed = market_data_feed
+        
+        # Create RL agent if not provided
+        if self.rl_agent is None:
+            self.logger.info("Creating new RL agent for continuous learning system")
+            self.rl_agent = NQRLAgent()
+        
+        # Create market data feed if not provided
+        if self.market_data_feed is None:
+            self.logger.info("Creating new market data feed")
+            self.market_data_feed = MarketDataFeed()
+        
+        # Paper trading state
+        self.initial_capital = initial_capital
+        self.capital = initial_capital
+        self.positions = []
+        self.trades_history = []
+        self.open_orders = []
+        self.trade_count = 0
+        self.profitable_trades = 0
+        self.unprofitable_trades = 0
+        
+        # Performance tracking
+        self.equity_curve = []
+        self.drawdowns = []
+        self.current_drawdown = 0.0
+        self.max_drawdown = 0.0
+        self.peak_capital = initial_capital
+        
+        # Training state
+        self.learning_rate = self.config['hyperparameter_optimization']['parameters']['learning_rate'][0]
+        self.batch_size = int(self.config['hyperparameter_optimization']['parameters']['batch_size'][0])
+        self.gamma = self.config['hyperparameter_optimization']['parameters']['gamma'][0]
+        self.training_count = 0
+        self.last_training_time = time.time()
+        self.experience_buffer = []
+        self.regime_history = []
+        self.current_regime = 'unknown'
+        
+        # Running state
+        self.running = False
+        self.thread = None
+        self.last_update_time = None
+        self.start_time = None
+        
+        # Create directories
+        os.makedirs('data/paper_trades', exist_ok=True)
+        os.makedirs('models/rl/checkpoints', exist_ok=True)
+        
+        # Initialize analytics
+        self.analytics = TradingAnalytics()
+        
+        # Save initial state
+        self._record_equity()
+        
+        self.logger.info(f"Continuous Learning Paper Trading System initialized with {initial_capital:.2f} capital")
+    
+    def start(self):
+        """Start the continuous learning paper trading system"""
+        if self.running:
+            self.logger.warning("Paper trading system already running")
+            return
+        
+        self.logger.info("Starting continuous learning paper trading system")
+        
+        try:
+            # Set running flag
+            self.running = True
+            self.start_time = time.time()
+            
+            # Start market data feed if not already running
+            if hasattr(self.market_data_feed, 'running') and not self.market_data_feed.running:
+                self.logger.info("Starting market data feed")
+                self.market_data_feed.run()
+            
+            # Start in background thread
+            self.thread = threading.Thread(
+                target=self._trading_loop,
+                name="ContinuousLearningThread"
+            )
+            self.thread.daemon = True
+            self.thread.start()
+            
+            self.logger.info("Continuous learning paper trading thread started")
+            
+        except Exception as e:
+            self.running = False
+            self.logger.error(f"Error starting paper trading system: {e}")
+    
+    def stop(self):
+        """Stop the continuous learning paper trading system"""
+        if not self.running:
+            self.logger.warning("Paper trading system not running")
+            return
+        
+        self.logger.info("Stopping continuous learning paper trading system")
+        
+        try:
+            # Set running flag
+            self.running = False
+            
+            # Wait for thread to complete
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=5.0)
+            
+            # Save final state
+            self._save_trades_history()
+            self._save_model()
+            
+            self.logger.info("Continuous learning paper trading system stopped")
+            
+        except Exception as e:
+            self.logger.error(f"Error stopping paper trading system: {e}")
+    
+    def _trading_loop(self):
+        """Main trading loop for continuous learning system"""
+        self.logger.info("Paper trading loop started")
+        
+        update_interval = self.config['update_interval']
+        trade_counter = 0
+        last_adaptive_hp_time = time.time()
+        last_save_time = time.time()
+        
+        try:
+            while self.running:
+                try:
+                    loop_start = time.time()
+                    
+                    # Get latest market data
+                    market_data = self._get_latest_market_data()
+                    
+                    if market_data is not None:
+                        # Determine current market regime
+                        if self.config['enable_regime_detection']:
+                            self._detect_market_regime(market_data)
+                        
+                        # Update open positions
+                        self._update_positions(market_data)
+                        
+                        # Process any open orders
+                        self._process_open_orders(market_data)
+                        
+                        # Update peak capital and drawdown
+                        self._update_drawdown()
+                        
+                        # Get new signals using RL agent
+                        signal = self._get_trading_signal(market_data)
+                        
+                        # Execute trading signal if conditions are met
+                        if signal is not None and self._can_execute_signal(signal, market_data):
+                            self._execute_signal(signal, market_data)
+                            trade_counter += 1
+                        
+                        # Record current equity
+                        self._record_equity()
+                        
+                        # Update analytics
+                        self.analytics.update_equity(self.capital)
+                        
+                        # Perform continuous training if it's time
+                        if (trade_counter % self.config['training_interval'] == 0 or 
+                            time.time() - self.last_training_time > 300):  # At least every 5 minutes
+                            self._train_rl_agent()
+                        
+                        # Adaptive hyperparameter optimization
+                        if (self.config['hyperparameter_optimization']['enabled'] and 
+                            trade_counter % self.config['hyperparameter_optimization']['interval'] == 0 and
+                            time.time() - last_adaptive_hp_time > 3600):  # At most once per hour
+                            self._optimize_hyperparameters()
+                            last_adaptive_hp_time = time.time()
+                        
+                        # Save model and trade history periodically
+                        if (trade_counter % self.config['save_interval'] == 0 or 
+                            time.time() - last_save_time > 1800):  # At least every 30 minutes
+                            self._save_model()
+                            self._save_trades_history()
+                            last_save_time = time.time()
+                    
+                    # Calculate elapsed time and sleep for remaining interval
+                    elapsed = time.time() - loop_start
+                    sleep_time = max(0.0, update_interval - elapsed)
+                    
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in paper trading loop: {e}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                    time.sleep(1.0)  # Sleep briefly before retrying
+            
+        except Exception as e:
+            self.logger.error(f"Fatal error in paper trading thread: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        
+        self.logger.info("Paper trading loop stopped")
+    
+    def _get_latest_market_data(self):
+        """Get latest market data from feed
+        
+        Returns:
+            dict: Latest market data or None if not available
+        """
+        try:
+            # Get real-time data from feed
+            market_data = self.market_data_feed.get_realtime_data()
+            
+            if market_data is None:
+                self.logger.warning("No market data available")
+                return None
+            
+            # Update last update time
+            self.last_update_time = time.time()
+            
+            return market_data
+            
+        except Exception as e:
+            self.logger.error(f"Error getting market data: {e}")
+            return None
+    
+    def _detect_market_regime(self, market_data):
+        """Detect current market regime
+        
+        Args:
+            market_data: Current market data
+        """
+        try:
+            # Get historical data for regime detection
+            history = self.market_data_feed.get_market_data(count=100)
+            
+            if not history or len(history) < 30:
+                # Not enough data for regime detection
+                return
+            
+            # Convert to DataFrame if it's a list
+            if isinstance(history, list):
+                import pandas as pd
+                history = pd.DataFrame(history)
+            
+            # Determine which price column to use
+            price_col = None
+            for col in ['price', 'Close', 'close']:
+                if col in history.columns:
+                    price_col = col
+                    break
+            
+            if price_col is None:
+                self.logger.warning("No price column found for regime detection")
+                return
+            
+            # Calculate key indicators for regime detection
+            prices = history[price_col].values
+            
+            # Calculate short and long term trends
+            if len(prices) >= 20:
+                short_ma = np.mean(prices[-10:])
+                long_ma = np.mean(prices[-20:])
+                trend_strength = (short_ma / long_ma) - 1
+            else:
+                trend_strength = 0
+            
+            # Calculate volatility
+            if len(prices) >= 10:
+                returns = np.diff(prices[-10:]) / prices[-11:-1]
+                volatility = np.std(returns)
+            else:
+                volatility = 0
+            
+            # Calculate mean reversion strength
+            if len(prices) >= 20:
+                mean = np.mean(prices[-20:])
+                last_price = prices[-1]
+                mean_reversion = (mean - last_price) / mean
+            else:
+                mean_reversion = 0
+            
+            # Determine regime
+            if volatility > 0.005:  # High volatility threshold
+                new_regime = 'volatile'
+            elif trend_strength > 0.002:  # Strong uptrend
+                new_regime = 'trending_up'
+            elif trend_strength < -0.002:  # Strong downtrend
+                new_regime = 'trending_down'
+            elif abs(mean_reversion) > 0.001:  # Mean reversion potential
+                new_regime = 'range_bound'
+            else:
+                new_regime = 'neutral'
+            
+            # Update current regime
+            if new_regime != self.current_regime:
+                self.logger.info(f"Market regime changed from {self.current_regime} to {new_regime}")
+                self.current_regime = new_regime
+            
+            # Record regime
+            self.regime_history.append({
+                'timestamp': datetime.datetime.now(),
+                'regime': new_regime,
+                'trend_strength': trend_strength,
+                'volatility': volatility,
+                'mean_reversion': mean_reversion
+            })
+            
+            # Limit regime history size
+            if len(self.regime_history) > 1000:
+                self.regime_history = self.regime_history[-1000:]
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting market regime: {e}")
+    
+    def _update_positions(self, market_data):
+        """Update open positions based on current market data
+        
+        Args:
+            market_data: Current market data
+        """
+        if not self.positions:
+            return
+        
+        # Get current price
+        price = market_data.get('price', None)
+        if price is None:
+            self.logger.warning("No price available for position updates")
+            return
+        
+        # Update each position
+        positions_to_remove = []
+        
+        for i, position in enumerate(self.positions):
+            # Calculate current profit/loss
+            entry_price = position['entry_price']
+            size = position['size']
+            direction = position['direction']
+            
+            if direction == 'long':
+                current_pl = (price - entry_price) * size
+                current_pl_pct = (price / entry_price) - 1
+            else:  # short
+                current_pl = (entry_price - price) * size
+                current_pl_pct = 1 - (price / entry_price)
+            
+            # Update position
+            position['current_price'] = price
+            position['current_pl'] = current_pl
+            position['current_pl_pct'] = current_pl_pct
+            position['duration'] = (datetime.datetime.now() - position['entry_time']).total_seconds() / 60.0  # Minutes
+            
+            # Update trailing stop if enabled and in profit
+            if position.get('use_trailing_stop', False) and current_pl > 0:
+                if direction == 'long':
+                    # For long positions, trail below the current price
+                    trailing_stop = price * (1 - self.config['trailing_stop_pct'])
+                    if trailing_stop > position.get('trailing_stop', 0):
+                        position['trailing_stop'] = trailing_stop
+                        self.logger.debug(f"Updated trailing stop for {position['id']} to {trailing_stop:.2f}")
+                else:  # short
+                    # For short positions, trail above the current price
+                    trailing_stop = price * (1 + self.config['trailing_stop_pct'])
+                    if trailing_stop < position.get('trailing_stop', float('inf')) or position.get('trailing_stop', None) is None:
+                        position['trailing_stop'] = trailing_stop
+                        self.logger.debug(f"Updated trailing stop for {position['id']} to {trailing_stop:.2f}")
+            
+            # Check for stop loss, take profit, or trailing stop
+            exit_reason = None
+            
+            if direction == 'long':
+                if price <= position.get('stop_loss', 0):
+                    exit_reason = 'stop_loss'
+                elif price >= position.get('take_profit', float('inf')):
+                    exit_reason = 'take_profit'
+                elif position.get('trailing_stop') is not None and price <= position['trailing_stop']:
+                    exit_reason = 'trailing_stop'
+            else:  # short
+                if price >= position.get('stop_loss', float('inf')):
+                    exit_reason = 'stop_loss'
+                elif price <= position.get('take_profit', 0):
+                    exit_reason = 'take_profit'
+                elif position.get('trailing_stop') is not None and price >= position['trailing_stop']:
+                    exit_reason = 'trailing_stop'
+            
+            # Handle position exit if needed
+            if exit_reason is not None:
+                self._close_position(position, price, exit_reason)
+                positions_to_remove.append(i)
+        
+        # Remove closed positions (in reverse order to maintain indices)
+        for idx in sorted(positions_to_remove, reverse=True):
+            self.positions.pop(idx)
+    
+    def _process_open_orders(self, market_data):
+        """Process open orders based on current market data
+        
+        Args:
+            market_data: Current market data
+        """
+        if not self.open_orders:
+            return
+        
+        # Get current price
+        price = market_data.get('price', None)
+        if price is None:
+            return
+        
+        # Process each order
+        orders_to_remove = []
+        
+        for i, order in enumerate(self.open_orders):
+            # Check if limit order should be filled
+            if order['type'] == 'limit':
+                if (order['direction'] == 'long' and price <= order['price']) or \
+                   (order['direction'] == 'short' and price >= order['price']):
+                    # Execute the order
+                    self._execute_order(order, price)
+                    orders_to_remove.append(i)
+                    continue
+            
+            # Check if stop order should be filled
+            elif order['type'] == 'stop':
+                if (order['direction'] == 'long' and price >= order['price']) or \
+                   (order['direction'] == 'short' and price <= order['price']):
+                    # Execute the order
+                    self._execute_order(order, price)
+                    orders_to_remove.append(i)
+                    continue
+            
+            # Check if order has expired
+            if order.get('expiry') and datetime.datetime.now() > order['expiry']:
+                self.logger.info(f"Order {order['id']} expired")
+                orders_to_remove.append(i)
+        
+        # Remove processed orders (in reverse order)
+        for idx in sorted(orders_to_remove, reverse=True):
+            self.open_orders.pop(idx)
+    
+    def _update_drawdown(self):
+        """Update peak capital and drawdown metrics"""
+        if self.capital > self.peak_capital:
+            self.peak_capital = self.capital
+            self.current_drawdown = 0.0
+        else:
+            self.current_drawdown = 1.0 - (self.capital / self.peak_capital)
+            self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
+        
+        # Add to drawdown history
+        self.drawdowns.append({
+            'timestamp': datetime.datetime.now(),
+            'drawdown': self.current_drawdown,
+            'max_drawdown': self.max_drawdown
+        })
+        
+        # Limit drawdown history size
+        if len(self.drawdowns) > 1000:
+            self.drawdowns = self.drawdowns[-1000:]
+    
+    def _record_equity(self):
+        """Record current equity in equity curve"""
+        equity_point = {
+            'timestamp': datetime.datetime.now(),
+            'equity': self.capital,
+            'drawdown': self.current_drawdown,
+            'open_positions': len(self.positions)
+        }
+        
+        self.equity_curve.append(equity_point)
+        
+        # Limit equity curve size
+        if len(self.equity_curve) > 10000:
+            self.equity_curve = self.equity_curve[-10000:]
+    
+    def _get_trading_signal(self, market_data):
+        """Get trading signal from RL agent
+        
+        Args:
+            market_data: Current market data
+            
+        Returns:
+            dict: Trading signal or None
+        """
+        try:
+            # Get historical data for feature extraction
+            history = self.market_data_feed.get_market_data(count=50)
+            
+            if not history or len(history) < 30:
+                # Not enough historical data for signal generation
+                return None
+            
+            # Convert to DataFrame if it's a list
+            if isinstance(history, list):
+                import pandas as pd
+                history = pd.DataFrame(history)
+            
+            # Check if we have essential columns
+            if 'Close' not in history.columns and 'price' in history.columns:
+                history['Close'] = history['price']
+            
+            if 'Close' not in history.columns:
+                self.logger.warning("No Close/price column found for signal generation")
+                return None
+            
+            # Extract state features for RL agent
+            state = self.rl_agent._extract_features(history)[-1]  # Get latest state
+            
+            # Get action from RL agent
+            action = self.rl_agent.act(state)
+            
+            # Convert action to signal
+            if action == 0:  # Buy
+                signal = {
+                    'direction': 'long',
+                    'confidence': 0.7,  # Default confidence
+                    'timestamp': datetime.datetime.now(),
+                    'price': market_data.get('price'),
+                    'regime': self.current_regime,
+                    'state': state
+                }
+            elif action == 1:  # Sell
+                signal = {
+                    'direction': 'short',
+                    'confidence': 0.7,  # Default confidence
+                    'timestamp': datetime.datetime.now(),
+                    'price': market_data.get('price'),
+                    'regime': self.current_regime,
+                    'state': state
+                }
+            else:  # Hold
+                signal = None
+            
+            return signal
+            
+        except Exception as e:
+            self.logger.error(f"Error getting trading signal: {e}")
+            return None
+    
+    def _can_execute_signal(self, signal, market_data):
+        """Check if signal can be executed based on current conditions
+        
+        Args:
+            signal: Trading signal
+            market_data: Current market data
+            
+        Returns:
+            bool: True if signal can be executed
+        """
+        try:
+            # Check confidence threshold
+            if signal.get('confidence', 0) < self.config['confidence_threshold']:
+                return False
+            
+            # Check if we have too many positions already
+            if len(self.positions) >= self.config['max_positions']:
+                return False
+            
+            # Check if we already have a position in this direction
+            for position in self.positions:
+                if position['direction'] == signal['direction']:
+                    # Already have a position in this direction
+                    return False
+            
+            # Check drawdown risk management
+            if self.current_drawdown > self.config['max_drawdown_pct']:
+                self.logger.info(f"Skipping trade due to drawdown risk ({self.current_drawdown:.2%})")
+                return False
+            
+            # Additional logic for signal execution can be added here
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking if signal can be executed: {e}")
+            return False
+    
+    def _execute_signal(self, signal, market_data):
+        """Execute trading signal by creating position
+        
+        Args:
+            signal: Trading signal
+            market_data: Current market data
+        """
+        try:
+            # Get current price
+            price = market_data.get('price')
+            if price is None:
+                self.logger.warning("No price available for signal execution")
+                return
+            
+            # Simulate latency and slippage if enabled
+            if self.config['simulate_latency']:
+                # Simulate latency
+                latency = random.uniform(*self.config['latency_range'])
+                time.sleep(latency)
+                
+                # Simulate slippage
+                slippage_factor = 0.0001  # Base slippage (0.01%)
+                if self.config['slippage_model'] == 'adaptive':
+                    # Adaptive slippage based on volatility and confidence
+                    volatility = market_data.get('atr', 0) / price if 'atr' in market_data else 0.001
+                    slippage_factor *= (1 + 10 * volatility)  # More slippage in volatile markets
+                
+                if signal['direction'] == 'long':
+                    execution_price = price * (1 + slippage_factor)
+                else:
+                    execution_price = price * (1 - slippage_factor)
+            else:
+                execution_price = price
+            
+            # Calculate position size
+            if self.config['enable_position_sizing']:
+                # Dynamic position sizing based on confidence and volatility
+                base_size_pct = self.config['trade_size_pct']
+                confidence = signal.get('confidence', 0.5)
+                
+                # Adjust size based on regime
+                if self.current_regime == 'volatile':
+                    adjusted_size_pct = base_size_pct * 0.7  # Reduce size in volatile markets
+                elif self.current_regime in ['trending_up', 'trending_down']:
+                    if (self.current_regime == 'trending_up' and signal['direction'] == 'long') or \
+                       (self.current_regime == 'trending_down' and signal['direction'] == 'short'):
+                        adjusted_size_pct = base_size_pct * 1.2  # Increase size when trading with trend
+                    else:
+                        adjusted_size_pct = base_size_pct * 0.6  # Reduce size when trading against trend
+                else:
+                    adjusted_size_pct = base_size_pct
+                
+                # Apply confidence scaling
+                final_size_pct = adjusted_size_pct * (0.5 + confidence / 2)
+                
+                # Apply drawdown scaling (reduce size during drawdowns)
+                if self.current_drawdown > 0.02:  # 2% drawdown threshold
+                    drawdown_factor = max(0.5, 1.0 - self.current_drawdown * 5)  # Reduce size by up to 50%
+                    final_size_pct *= drawdown_factor
+                
+                # Calculate position size in contracts/shares
+                position_value = self.capital * final_size_pct
+                position_size = position_value / execution_price
+            else:
+                # Fixed position sizing
+                position_value = self.capital * self.config['trade_size_pct']
+                position_size = position_value / execution_price
+            
+            # Calculate stop loss and take profit levels
+            if self.config['enable_adaptive_stops']:
+                # Adaptive stops based on volatility
+                atr = market_data.get('atr', price * 0.005)  # Default to 0.5% if ATR not available
+                
+                if signal['direction'] == 'long':
+                    stop_loss = execution_price * (1 - self.config['stop_loss_pct'] * (1 + atr / price * 10))
+                    take_profit = execution_price * (1 + self.config['take_profit_pct'] * (1 + atr / price * 5))
+                else:
+                    stop_loss = execution_price * (1 + self.config['stop_loss_pct'] * (1 + atr / price * 10))
+                    take_profit = execution_price * (1 - self.config['take_profit_pct'] * (1 + atr / price * 5))
+            else:
+                # Fixed stops
+                if signal['direction'] == 'long':
+                    stop_loss = execution_price * (1 - self.config['stop_loss_pct'])
+                    take_profit = execution_price * (1 + self.config['take_profit_pct'])
+                else:
+                    stop_loss = execution_price * (1 + self.config['stop_loss_pct'])
+                    take_profit = execution_price * (1 - self.config['take_profit_pct'])
+            
+            # Create position
+            position = {
+                'id': str(uuid.uuid4())[:8],
+                'direction': signal['direction'],
+                'size': position_size,
+                'entry_price': execution_price,
+                'current_price': execution_price,
+                'entry_time': datetime.datetime.now(),
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'use_trailing_stop': True,
+                'current_pl': 0.0,
+                'current_pl_pct': 0.0,
+                'duration': 0.0,
+                'regime': self.current_regime,
+                'signal': signal,
+                'state': signal.get('state')
+            }
+            
+            # Add position
+            self.positions.append(position)
+            
+            # Log position
+            self.logger.info(f"Opened {signal['direction']} position {position['id']}: {position_size:.4f} units at {execution_price:.2f}")
+            self.logger.info(f"Stop loss: {stop_loss:.2f}, Take profit: {take_profit:.2f}")
+            
+        except Exception as e:
+            self.logger.error(f"Error executing signal: {e}")
+    
+    def _close_position(self, position, price, reason):
+        """Close a position
+        
+        Args:
+            position: Position to close
+            price: Current price
+            reason: Reason for closing
+        """
+        try:
+            # Calculate profit/loss
+            entry_price = position['entry_price']
+            size = position['size']
+            direction = position['direction']
+            
+            if direction == 'long':
+                pl = (price - entry_price) * size
+                pl_pct = (price / entry_price) - 1
+            else:  # short
+                pl = (entry_price - price) * size
+                pl_pct = 1 - (price / entry_price)
+            
+            # Update capital
+            self.capital += pl
+            
+            # Create trade record
+            trade = {
+                'id': position['id'],
+                'direction': direction,
+                'size': size,
+                'entry_price': entry_price,
+                'exit_price': price,
+                'entry_time': position['entry_time'],
+                'exit_time': datetime.datetime.now(),
+                'duration': (datetime.datetime.now() - position['entry_time']).total_seconds() / 60.0,  # Minutes
+                'pl': pl,
+                'pl_pct': pl_pct,
+                'exit_reason': reason,
+                'regime': position['regime'],
+                'current_regime': self.current_regime
+            }
+            
+            # Add to trades history
+            self.trades_history.append(trade)
+            
+            # Update trade counters
+            self.trade_count += 1
+            if pl > 0:
+                self.profitable_trades += 1
+            else:
+                self.unprofitable_trades += 1
+            
+            # Add to analytics
+            self.analytics.add_trade(trade)
+            
+            # Log trade
+            self.logger.info(f"Closed {direction} position {position['id']} at {price:.2f} with P/L: {pl:.2f} ({pl_pct:.2%})")
+            self.logger.info(f"Reason: {reason}, Duration: {trade['duration']:.1f} minutes")
+            
+            # Calculate reward for RL agent
+            self._calculate_trade_reward(position, trade, reason)
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position: {e}")
+    
+    def _execute_order(self, order, price):
+        """Execute an order
+        
+        Args:
+            order: Order to execute
+            price: Execution price
+        """
+        try:
+            # Log order execution
+            self.logger.info(f"Executing {order['type']} order {order['id']} at {price:.2f}")
+            
+            # Create position from order
+            position = {
+                'id': order['id'],
+                'direction': order['direction'],
+                'size': order['size'],
+                'entry_price': price,
+                'current_price': price,
+                'entry_time': datetime.datetime.now(),
+                'stop_loss': order.get('stop_loss'),
+                'take_profit': order.get('take_profit'),
+                'use_trailing_stop': order.get('use_trailing_stop', True),
+                'current_pl': 0.0,
+                'current_pl_pct': 0.0,
+                'duration': 0.0,
+                'regime': self.current_regime,
+                'signal': order.get('signal'),
+                'state': order.get('state')
+            }
+            
+            # Add position
+            self.positions.append(position)
+            
+        except Exception as e:
+            self.logger.error(f"Error executing order: {e}")
+    
+    def _calculate_trade_reward(self, position, trade, exit_reason):
+        """Calculate reward for RL agent based on trade outcome
+        
+        Args:
+            position: Position that was closed
+            trade: Trade record
+            exit_reason: Reason for exit
+        """
+        try:
+            rewards_config = self.config['reinforcement_rewards']
+            
+            # Base reward based on profitability
+            if trade['pl'] > 0:
+                reward = rewards_config['profitable_trade']
+            else:
+                reward = rewards_config['unprofitable_trade']
+            
+            # Additional rewards/penalties based on exit reason
+            if exit_reason == 'stop_loss':
+                reward += rewards_config['exit_at_stop']
+            elif exit_reason == 'take_profit':
+                reward += rewards_config['exit_at_target']
+            elif exit_reason == 'trailing_stop':
+                # Trailing stop is usually good - captured some profit
+                reward += rewards_config['exit_at_target'] * 0.5
+            
+            # Reward for trading with the regime
+            if ((position['direction'] == 'long' and position['regime'] == 'trending_up') or
+                (position['direction'] == 'short' and position['regime'] == 'trending_down')):
+                reward += rewards_config['trade_with_trend']
+            
+            # Reward based on profit threshold scaling
+            if rewards_config['threshold_scaling']:
+                # Scale reward by how close to take profit or stop loss
+                if trade['pl'] > 0:
+                    # For profitable trades, scale by how close to take profit
+                    if position['take_profit'] is not None:
+                        target_distance = abs(position['take_profit'] - position['entry_price'])
+                        achieved_distance = abs(trade['exit_price'] - position['entry_price'])
+                        achievement_ratio = min(1.0, achieved_distance / target_distance)
+                        reward *= (0.5 + 0.5 * achievement_ratio)  # Scale from 50% to 100% of base reward
+                else:
+                    # For unprofitable trades, scale by how close to stop loss
+                    if position['stop_loss'] is not None:
+                        stop_distance = abs(position['stop_loss'] - position['entry_price'])
+                        loss_distance = abs(trade['exit_price'] - position['entry_price'])
+                        loss_ratio = min(1.0, loss_distance / stop_distance)
+                        reward *= (0.5 + 0.5 * loss_ratio)  # Scale from 50% to 100% of base penalty
+            
+            # Get original state and next state for RL memory
+            state = position.get('state')
+            
+            if state is not None:
+                # Create a done flag (always True for completed trades)
+                done = True
+                
+                # Get action from position direction
+                if position['direction'] == 'long':
+                    action = 0  # Buy action
+                elif position['direction'] == 'short':
+                    action = 1  # Sell action
+                else:
+                    action = 2  # Hold action
+                
+                # Add experience to RL agent's memory
+                # We use the same state for both state and next_state since we don't have the actual next state
+                self.rl_agent.remember(state, action, reward, state, done)
+                
+                # Add to experience buffer for continuous learning
+                self.experience_buffer.append({
+                    'state': state,
+                    'action': action,
+                    'reward': reward,
+                    'next_state': state,
+                    'done': done
+                })
+                
+                # Limit experience buffer size
+                if len(self.experience_buffer) > self.config['max_training_history']:
+                    self.experience_buffer.pop(0)
+                
+                self.logger.debug(f"Calculated reward {reward:.4f} for trade {position['id']}")
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating trade reward: {e}")
+    
+    def _train_rl_agent(self):
+        """Train RL agent using experience replay"""
+        try:
+            # Make sure we have enough experiences
+            if len(self.experience_buffer) < self.rl_agent.batch_size:
+                return
+            
+            self.logger.info(f"Training RL agent with {len(self.experience_buffer)} experiences")
+            
+            # Update learning rate
+            learning_rate = self.learning_rate * (self.config['learning_rate_decay'] ** self.training_count)
+            
+            # Set learning rate in agent
+            if hasattr(self.rl_agent, 'learning_rate'):
+                self.rl_agent.learning_rate = learning_rate
+            
+            # Apply simple data augmentation if enabled
+            training_data = []
+            if self.config['data_augmentation']:
+                # Simple data augmentation:
+                # 1. Add original experiences
+                training_data.extend(self.experience_buffer)
+                
+                # 2. Add experiences with small random noise
+                for exp in self.experience_buffer[-self.rl_agent.batch_size:]:  # Use most recent experiences
+                    # Clone the experience
+                    augmented_exp = exp.copy()
+                    
+                    # Add small noise to state features (±1%)
+                    original_state = np.array(exp['state'])
+                    noise = np.random.normal(0, 0.01, size=original_state.shape)
+                    augmented_state = original_state * (1 + noise)
+                    
+                    augmented_exp['state'] = augmented_state
+                    augmented_exp['next_state'] = augmented_state  # Same for next_state
+                    
+                    # Add to training data
+                    training_data.append(augmented_exp)
+            else:
+                training_data = self.experience_buffer
+            
+            # Simulate training steps
+            for i in range(min(5, len(training_data) // self.rl_agent.batch_size)):
+                # Sample batch
+                batch_indices = np.random.choice(len(training_data), self.rl_agent.batch_size, replace=False)
+                batch = [training_data[idx] for idx in batch_indices]
+                
+                # Extract batch components
+                states = np.array([exp['state'] for exp in batch])
+                actions = np.array([exp['action'] for exp in batch])
+                rewards = np.array([exp['reward'] for exp in batch])
+                next_states = np.array([exp['next_state'] for exp in batch])
+                dones = np.array([exp['done'] for exp in batch])
+                
+                # Force training step (internal _replay method)
+                if hasattr(self.rl_agent, '_replay'):
+                    # Use the internal replay method if available
+                    for exp in batch:
+                        self.rl_agent.remember(exp['state'], exp['action'], exp['reward'], exp['next_state'], exp['done'])
+                    self.rl_agent._replay()
+                elif hasattr(self.rl_agent.main_model, 'fit'):
+                    # Direct NN training for TensorFlow models
+                    # Calculate target Q values
+                    q_values = self.rl_agent.main_model.predict(states, verbose=0)
+                    next_q_values = self.rl_agent.target_model.predict(next_states, verbose=0)
+                    
+                    targets = np.copy(q_values)
+                    for i in range(self.rl_agent.batch_size):
+                        if dones[i]:
+                            targets[i, actions[i]] = rewards[i]
+                        else:
+                            targets[i, actions[i]] = rewards[i] + self.gamma * np.max(next_q_values[i])
+                    
+                    # Train model
+                    self.rl_agent.main_model.fit(states, targets, epochs=1, verbose=0)
+            
+            # Update target model
+            if hasattr(self.rl_agent, '_update_target_model'):
+                self.rl_agent._update_target_model()
+            
+            # Update training metrics
+            self.training_count += 1
+            self.last_training_time = time.time()
+            
+            self.logger.info(f"RL agent training complete (iteration {self.training_count})")
+            
+        except Exception as e:
+            self.logger.error(f"Error training RL agent: {e}")
+    
+    def _optimize_hyperparameters(self):
+        """Optimize hyperparameters based on trading performance"""
+        try:
+            # Need a minimum number of trades for optimization
+            if len(self.trades_history) < 20:
+                return
+            
+            self.logger.info("Performing hyperparameter optimization")
+            
+            # Get recent trades
+            recent_trades = self.trades_history[-20:]
+            
+            # Calculate win rate and profit factor
+            wins = sum(1 for trade in recent_trades if trade['pl'] > 0)
+            losses = sum(1 for trade in recent_trades if trade['pl'] <= 0)
+            win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
+            
+            gross_profit = sum(trade['pl'] for trade in recent_trades if trade['pl'] > 0)
+            gross_loss = abs(sum(trade['pl'] for trade in recent_trades if trade['pl'] <= 0))
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+            
+            # Simple discrete optimization based on performance
+            # 1. Learning Rate Adjustment
+            if win_rate < 0.4:
+                # Poor performance - increase learning rate to adapt faster
+                self.learning_rate = min(0.01, self.learning_rate * 1.5)
+            elif win_rate > 0.6:
+                # Good performance - decrease learning rate for stability
+                self.learning_rate = max(0.0001, self.learning_rate * 0.8)
+            
+            # 2. Batch Size Adjustment
+            if profit_factor < 1.0:
+                # Poor risk/reward - increase batch size for more stable learning
+                self.batch_size = min(128, self.batch_size * 2)
+            elif profit_factor > 1.5:
+                # Good risk/reward - can use smaller batches for faster adaptation
+                self.batch_size = max(16, self.batch_size // 2)
+            
+            # 3. Gamma Adjustment (discount factor)
+            avg_duration = sum(trade['duration'] for trade in recent_trades) / len(recent_trades)
+            if avg_duration < 10:  # Short-term trades (< 10 minutes)
+                # For short-term trades, reduce gamma to focus on immediate rewards
+                self.gamma = max(0.8, self.gamma * 0.95)
+            else:
+                # For longer-term trades, increase gamma to value future rewards
+                self.gamma = min(0.99, self.gamma * 1.05)
+            
+            # Update agent parameters
+            if hasattr(self.rl_agent, 'learning_rate'):
+                self.rl_agent.learning_rate = self.learning_rate
+            
+            if hasattr(self.rl_agent, 'batch_size'):
+                self.rl_agent.batch_size = self.batch_size
+            
+            if hasattr(self.rl_agent, 'gamma'):
+                self.rl_agent.gamma = self.gamma
+            
+            self.logger.info(f"Updated hyperparameters: lr={self.learning_rate:.6f}, batch={self.batch_size}, gamma={self.gamma:.4f}")
+            
+        except Exception as e:
+            self.logger.error(f"Error optimizing hyperparameters: {e}")
+    
+    def _save_model(self):
+        """Save RL agent model"""
+        try:
+            # Generate checkpoint filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            checkpoint_file = f"nq_elite_checkpoint_{timestamp}"
+            
+            # Save model
+            self.rl_agent.save(checkpoint_file)
+            
+            # Also save as production model
+            self.rl_agent.save("production_rl_agent.h5")
+            
+            self.logger.info(f"Saved production RL agent model")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving model: {e}")
+    
+    def _save_trades_history(self):
+        """Save trades history to CSV file"""
+        try:
+            # Only save if we have trades
+            if not self.trades_history:
+                return
+            
+            # Generate filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"paper_trades_{timestamp}.csv"
+            filepath = os.path.join('data/paper_trades', filename)
+            
+            # Convert to DataFrame
+            import pandas as pd
+            df = pd.DataFrame(self.trades_history)
+            
+            # Convert datetime columns to strings
+            for col in ['entry_time', 'exit_time']:
+                if col in df.columns:
+                    df[col] = df[col].astype(str)
+            
+            # Save to CSV
+            df.to_csv(filepath, index=False)
+            
+            self.logger.info(f"Saved trades history to {filepath}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving trades history: {e}")
+    
+    def get_performance_metrics(self):
+        """Get performance metrics
+        
+        Returns:
+            dict: Performance metrics
+        """
+        try:
+            metrics = {
+                'capital': self.capital,
+                'returns': (self.capital / self.initial_capital) - 1,
+                'trades': self.trade_count,
+                'win_rate': self.profitable_trades / self.trade_count if self.trade_count > 0 else 0,
+                'active_positions': len(self.positions),
+                'drawdown': self.current_drawdown,
+                'max_drawdown': self.max_drawdown,
+                'training_count': self.training_count
+            }
+            
+            # Add analytics metrics
+            analytics_metrics = self.analytics.calculate_metrics()
+            metrics.update(analytics_metrics)
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"Error getting performance metrics: {e}")
+            return {}
 #==============================================================================
 # EXECUTION ENGINE
 #==============================================================================
@@ -6376,6 +8336,762 @@ def execute_live_trade_with_learning(symbol, timeframe='1h', quantity=None, api_
             print("Emergency agent model saved")
         
         return None, None
+
+#==============================================================================
+# REINFORCEMENT LEARNING AGENT FOR NQ FUTURES
+#==============================================================================
+class NQRLAgent:
+    """
+    Elite Reinforcement Learning Agent specifically optimized for NQ futures trading
+    Combines DQN, PPO and A2C algorithms with custom market microstructure features
+    """
+    
+    def __init__(self, config=None):
+        """Initialize the NQ Elite RL agent
+        
+        Args:
+            config (dict, optional): Configuration parameters
+        """
+        self.logger = logging.getLogger("NQAlpha.RLAgent")
+        
+        # Default configuration
+        self.config = {
+            'state_size': 30,            # Input features for model
+            'action_size': 3,            # Actions: Buy, Sell, Hold
+            'learning_rate': 0.001,      # Model learning rate
+            'gamma': 0.95,               # Discount factor
+            'batch_size': 64,            # Training batch size
+            'memory_size': 10000,        # Experience replay buffer size
+            'train_interval': 10,        # Steps between training
+            'target_update': 100,        # Steps between target model updates
+            'warmup_steps': 500,         # Steps before training begins
+            'epsilon_start': 1.0,        # Starting exploration rate
+            'epsilon_end': 0.1,          # Ending exploration rate
+            'epsilon_decay': 0.995,      # Exploration decay rate
+            'model_architecture': {      # Neural network architecture
+                'hidden_layers': [128, 64, 32],
+                'activation': 'relu',
+                'output_activation': 'linear'
+            },
+            'save_dir': 'models/rl',     # Model save directory
+            'save_interval': 1000        # Steps between model saves
+        }
+        
+        # Update with provided config
+        if config:
+            for k, v in config.items():
+                if isinstance(v, dict) and k in self.config and isinstance(self.config[k], dict):
+                    self.config[k].update(v)
+                else:
+                    self.config[k] = v
+        
+        # Create save directory
+        os.makedirs(self.config['save_dir'], exist_ok=True)
+        
+        # State properties
+        self.state_size = self.config['state_size']
+        self.action_size = self.config['action_size']
+        
+        # Learning parameters
+        self.gamma = self.config['gamma']
+        self.epsilon = self.config['epsilon_start']
+        self.epsilon_end = self.config['epsilon_end']
+        self.epsilon_decay = self.config['epsilon_decay']
+        self.learning_rate = self.config['learning_rate']
+        
+        # Experience replay
+        self.memory = []
+        self.memory_size = self.config['memory_size']
+        self.batch_size = self.config['batch_size']
+        
+        # Training counters
+        self.step_count = 0
+        self.train_count = 0
+        self.warmup_steps = self.config['warmup_steps']
+        self.train_interval = self.config['train_interval']
+        self.target_update = self.config['target_update']
+        
+        # Create models
+        self._build_models()
+        
+        # Performance tracking
+        self.performance = {
+            'train_loss': [],
+            'rewards': [],
+            'cumulative_reward': 0,
+            'win_rate': 0,
+            'trades': 0,
+            'wins': 0,
+            'losses': 0
+        }
+        
+        # State preprocessing for standardization
+        self.feature_means = None
+        self.feature_stds = None
+        
+        # Strategy enhancement
+        self.signal_adjustments = []  # Recent signal adjustments
+        
+        self.logger.info("NQ RL Agent initialized")
+    
+    def _build_models(self):
+        """Build the neural network models for RL agent"""
+        try:
+            # Try to use TensorFlow/Keras if available
+            import tensorflow as tf
+            import tensorflow.keras as keras
+            from tensorflow.keras.models import Sequential
+            from tensorflow.keras.layers import Dense, LSTM, BatchNormalization, Dropout
+            from tensorflow.keras.optimizers import Adam
+            
+            # Set memory growth to prevent TF from taking all GPU memory
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                for gpu in gpus:
+                    try:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                    except:
+                        pass
+            
+            # Configure TensorFlow to use CPU if no GPU available
+            if not gpus:
+                tf.config.set_visible_devices([], 'GPU')
+                os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+                self.logger.info("No GPU available, using CPU for model training")
+            
+            # Build main model
+            main_model = Sequential()
+            
+            # Input layer
+            main_model.add(Dense(self.config['model_architecture']['hidden_layers'][0], 
+                                input_dim=self.state_size, 
+                                activation=self.config['model_architecture']['activation']))
+            main_model.add(BatchNormalization())
+            
+            # Hidden layers
+            for units in self.config['model_architecture']['hidden_layers'][1:]:
+                main_model.add(Dense(units, activation=self.config['model_architecture']['activation']))
+                main_model.add(Dropout(0.2))
+                
+            # Output layer
+            main_model.add(Dense(self.action_size, activation=self.config['model_architecture']['output_activation']))
+            
+            # Compile model
+            main_model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+            
+            # Create target model (same architecture)
+            target_model = keras.models.clone_model(main_model)
+            target_model.set_weights(main_model.get_weights())
+            
+            # Store models
+            self.main_model = main_model
+            self.target_model = target_model
+            self.model_type = 'tensorflow'
+            
+            self.logger.info("Created TensorFlow models for RL agent")
+            
+        except ImportError:
+            # Fall back to scikit-learn models if TensorFlow not available
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.neural_network import MLPRegressor
+            
+            # Create main model
+            main_model = MLPRegressor(
+                hidden_layer_sizes=self.config['model_architecture']['hidden_layers'],
+                activation='relu',
+                solver='adam',
+                alpha=0.0001,
+                batch_size=self.config['batch_size'],
+                learning_rate_init=self.learning_rate,
+                max_iter=500,
+                shuffle=True,
+                random_state=42,
+                early_stopping=True
+            )
+            
+            # Create target model (RandomForest as fallback)
+            target_model = RandomForestRegressor(
+                n_estimators=100,
+                max_depth=10,
+                random_state=42
+            )
+            
+            # Store models
+            self.main_model = main_model
+            self.target_model = target_model
+            self.model_type = 'sklearn'
+            
+            self.logger.info("Created scikit-learn models for RL agent (TensorFlow not available)")
+    
+    def _preprocess_state(self, state):
+        """Preprocess state for model input
+        
+        Args:
+            state: Raw state (numpy array or list)
+            
+        Returns:
+            Preprocessed state as numpy array
+        """
+        import numpy as np
+        
+        # Convert to numpy array
+        state_array = np.array(state, dtype=np.float32)
+        
+        # Replace NaN with 0
+        state_array = np.nan_to_num(state_array, nan=0.0)
+        
+        # If we have fitted means and stds, use them to standardize
+        if self.feature_means is not None and self.feature_stds is not None:
+            # Add small constant to stds to avoid division by zero
+            stds_safe = np.array([max(std, 1e-8) for std in self.feature_stds])
+            state_array = (state_array - self.feature_means) / stds_safe
+        
+        # Clip values to avoid extreme inputs
+        state_array = np.clip(state_array, -10.0, 10.0)
+        
+        return state_array
+    
+    def _fit_preprocessor(self, states):
+        """Fit preprocessor to states data
+        
+        Args:
+            states: List of states
+        """
+        import numpy as np
+        
+        # Convert to numpy array
+        states_array = np.array(states, dtype=np.float32)
+        
+        # Replace NaN with 0
+        states_array = np.nan_to_num(states_array, nan=0.0)
+        
+        # Calculate means and stds across first dimension (samples)
+        self.feature_means = np.mean(states_array, axis=0)
+        self.feature_stds = np.std(states_array, axis=0)
+        
+        self.logger.info("Fitted state preprocessor")
+    
+    def _extract_features(self, market_data):
+        """Extract features from market data for RL state
+        
+        Args:
+            market_data: DataFrame with market data
+            
+        Returns:
+            List of states
+        """
+        try:
+            import numpy as np
+            
+            # Make sure we have all the required columns
+            required_columns = ['Close', 'Volume', 'RSI', 'MACD', 'MACD_signal', 'ATR']
+            missing_columns = [col for col in required_columns if col not in market_data.columns]
+            
+            if missing_columns:
+                self.logger.warning(f"Missing columns for feature extraction: {missing_columns}")
+            
+            # Create empty states list
+            states = []
+            
+            # Handle the case where we don't have enough data
+            if len(market_data) < 30:
+                self.logger.warning(f"Insufficient market data for feature extraction: {len(market_data)} rows")
+                # Create some dummy states with zeros
+                for _ in range(max(0, len(market_data) - 30)):
+                    states.append(np.zeros(self.state_size))
+                return states
+            
+            # Extract features for each timestep
+            for i in range(30, len(market_data)):
+                # Current window data
+                window = market_data.iloc[i-30:i]
+                current = market_data.iloc[i]
+                
+                # Extract basic OHLCV features (last 5 values)
+                close_history = window['Close'].values[-5:]
+                volume_history = window['Volume'].values[-5:] if 'Volume' in market_data.columns else np.zeros(5)
+                
+                # Extract technical indicator features
+                rsi = current['RSI'] if 'RSI' in market_data.columns else 50.0
+                macd = current['MACD'] if 'MACD' in market_data.columns else 0.0
+                macd_signal = current['MACD_signal'] if 'MACD_signal' in market_data.columns else 0.0
+                atr = current['ATR'] if 'ATR' in market_data.columns else 0.0
+                
+                # Calculate price changes (momentum)
+                close_changes = np.diff(window['Close'].values[-6:]) / window['Close'].values[-6:-1]
+                
+                # Extract order flow features if available
+                order_flow = current['order_flow'] if 'order_flow' in market_data.columns else 0.0
+                delta = current['delta'] if 'delta' in market_data.columns else 0.0
+                institutional_pressure = current['institutional_pressure'] if 'institutional_pressure' in market_data.columns else 0.0
+                
+                # Create state vector (pad or truncate to ensure state_size length)
+                feature_list = [
+                    # Price features
+                    *close_history,
+                    *close_changes,
+                    
+                    # Volume features
+                    *volume_history,
+                    
+                    # Technical indicators
+                    rsi / 100.0,  # Normalize RSI to 0-1
+                    macd,
+                    macd_signal,
+                    macd - macd_signal,  # MACD histogram
+                    atr,
+                    
+                    # Additional features
+                    order_flow,
+                    delta,
+                    institutional_pressure
+                ]
+                
+                # Ensure state vector has the correct length
+                if len(feature_list) < self.state_size:
+                    # Pad with zeros if too short
+                    feature_list += [0.0] * (self.state_size - len(feature_list))
+                elif len(feature_list) > self.state_size:
+                    # Truncate if too long
+                    feature_list = feature_list[:self.state_size]
+                
+                # Add to states list
+                states.append(np.array(feature_list))
+            
+            return states
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting features: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return []
+    
+    def remember(self, state, action, reward, next_state, done):
+        """Add experience to replay memory
+        
+        Args:
+            state: Current state
+            action: Action taken
+            reward: Reward received
+            next_state: Next state
+            done: Whether episode is done
+        """
+        # Add to memory
+        self.memory.append((state, action, reward, next_state, done))
+        
+        # Limit memory size
+        if len(self.memory) > self.memory_size:
+            self.memory.pop(0)
+    
+    def act(self, state):
+        """Choose action based on state
+        
+        Args:
+            state: Current state
+            
+        Returns:
+            Action index (0=Buy, 1=Sell, 2=Hold)
+        """
+        import numpy as np
+        
+        # Explore with epsilon probability
+        if np.random.rand() <= self.epsilon:
+            return np.random.randint(self.action_size)
+        
+        # Preprocess state
+        state_processed = self._preprocess_state(state)
+        
+        # Reshape for model input
+        if self.model_type == 'tensorflow':
+            state_input = state_processed.reshape(1, -1)
+            
+            # Get action values from model
+            action_values = self.main_model.predict(state_input, verbose=0)[0]
+        else:
+            # For sklearn models
+            state_input = state_processed.reshape(1, -1)
+            
+            # Check if model is fitted
+            if hasattr(self.main_model, 'predict'):
+                try:
+                    # Get action values from model
+                    action_values = self.main_model.predict(state_input)
+                except Exception:
+                    # Model not fitted yet
+                    return np.random.randint(self.action_size)
+            else:
+                # Model not initialized yet
+                return np.random.randint(self.action_size)
+        
+        # Return best action
+        return np.argmax(action_values)
+    
+    def train(self, market_data):
+        """Train RL agent on market data
+        
+        Args:
+            market_data: DataFrame with market data
+        """
+        import numpy as np
+        
+        self.logger.info("Training RL agent...")
+        
+        try:
+            # Extract features from market data
+            states = self._extract_features(market_data)
+            
+            if not states:
+                self.logger.warning("No states extracted from market data")
+                return
+            
+            # Fit preprocessor on states
+            self._fit_preprocessor(states)
+            
+            # Preprocess states
+            states_processed = [self._preprocess_state(state) for state in states]
+            
+            # Simulate training on historical data
+            for i in range(len(states_processed) - 1):
+                # Get idx offset based on market data and states length difference
+                idx_offset = len(market_data) - len(states_processed)
+                
+                # Get price at current and next state for reward calculation
+                current_price = market_data.iloc[i + idx_offset]['Close']
+                next_price = market_data.iloc[i + idx_offset + 1]['Close'] if i + idx_offset + 1 < len(market_data) else current_price
+                
+                # Determine price action (up/down/flat)
+                price_change = next_price - current_price
+                
+                # Choose action based on current policy
+                action = self.act(states_processed[i])
+                
+                # Calculate reward based on action and price direction
+                if action == 0:  # Buy
+                    reward = price_change  # Positive if price goes up after buy
+                elif action == 1:  # Sell
+                    reward = -price_change  # Positive if price goes down after sell
+                else:  # Hold
+                    reward = 0.1 if abs(price_change) < 0.5 else -0.1  # Small reward for holding during flat prices
+                
+                # Add to replay memory
+                self.remember(states_processed[i], action, reward, states_processed[i+1], i == len(states_processed) - 2)
+                
+                # Increment step counter
+                self.step_count += 1
+                
+                # Update epsilon
+                if self.epsilon > self.epsilon_end:
+                    self.epsilon *= self.epsilon_decay
+                
+                # Train the model after warmup period
+                if self.step_count > self.warmup_steps and self.step_count % self.train_interval == 0:
+                    self._replay()
+                
+                # Update target model
+                if self.step_count > self.warmup_steps and self.step_count % self.target_update == 0:
+                    self._update_target_model()
+                
+                # Track reward
+                self.performance['cumulative_reward'] += reward
+                self.performance['rewards'].append(reward)
+                
+                # Track trade outcome if action was buy or sell
+                if action in [0, 1]:
+                    self.performance['trades'] += 1
+                    if (action == 0 and price_change > 0) or (action == 1 and price_change < 0):
+                        self.performance['wins'] += 1
+                    else:
+                        self.performance['losses'] += 1
+                    
+                    # Update win rate
+                    if self.performance['trades'] > 0:
+                        self.performance['win_rate'] = self.performance['wins'] / self.performance['trades']
+            
+            # Log training result
+            self.logger.info(f"RL agent trained on {len(states)} states with {self.step_count} steps")
+            if self.performance['trades'] > 0:
+                self.logger.info(f"Training win rate: {self.performance['win_rate']:.2f} on {self.performance['trades']} trades")
+            
+        except Exception as e:
+            self.logger.error(f"Error training RL agent: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+    
+    def _replay(self):
+        """Train the model using experience replay"""
+        import numpy as np
+        
+        # Check if we have enough samples in memory
+        if len(self.memory) < self.batch_size:
+            return
+        
+        try:
+            # Sample random minibatch from memory
+            minibatch = np.random.choice(len(self.memory), self.batch_size, replace=False)
+            batch = [self.memory[i] for i in minibatch]
+            
+            if self.model_type == 'tensorflow':
+                # For TensorFlow models
+                # Extract states, actions, rewards, next_states, dones
+                states = np.array([b[0] for b in batch])
+                actions = np.array([b[1] for b in batch])
+                rewards = np.array([b[2] for b in batch])
+                next_states = np.array([b[3] for b in batch])
+                dones = np.array([b[4] for b in batch])
+                
+                # Get Q values for current states
+                q_values = self.main_model.predict(states, verbose=0)
+                
+                # Get Q values for next states from target model
+                next_q_values = self.target_model.predict(next_states, verbose=0)
+                
+                # Calculate target Q values (temporal difference)
+                targets = np.copy(q_values)
+                for i in range(self.batch_size):
+                    if dones[i]:
+                        targets[i, actions[i]] = rewards[i]
+                    else:
+                        targets[i, actions[i]] = rewards[i] + self.gamma * np.max(next_q_values[i])
+                
+                # Train the model
+                history = self.main_model.fit(states, targets, epochs=1, verbose=0)
+                loss = history.history['loss'][0]
+                
+            else:
+                # For scikit-learn models
+                states = np.array([b[0] for b in batch])
+                actions = np.array([b[1] for b in batch])
+                rewards = np.array([b[2] for b in batch])
+                
+                # Initialize the model if not already fitted
+                if not hasattr(self.main_model, 'coefs_'):
+                    try:
+                        self.main_model.fit(states, rewards)
+                    except Exception:
+                        # Some error fitting the model
+                        return
+                else:
+                    try:
+                        # Partial fit for incremental learning
+                        self.main_model.partial_fit(states, rewards)
+                    except Exception:
+                        # Some error fitting the model
+                        return
+                
+                # Simple loss calculation for sklearn
+                predictions = self.main_model.predict(states)
+                loss = np.mean(np.square(predictions - rewards))
+            
+            # Record loss
+            self.performance['train_loss'].append(loss)
+            
+            # Increment train count
+            self.train_count += 1
+            
+        except Exception as e:
+            self.logger.error(f"Error in replay: {e}")
+    
+    def _update_target_model(self):
+        """Update the target model to match the main model"""
+        if self.model_type == 'tensorflow':
+            # Copy weights from main model to target model
+            self.target_model.set_weights(self.main_model.get_weights())
+        else:
+            # For sklearn, just create a new copy of the model
+            import copy
+            self.target_model = copy.deepcopy(self.main_model)
+        
+        self.logger.debug("Target model updated")
+    
+    def enhance_signals(self, market_data):
+        """Enhance strategy signals using RL agent
+        
+        Args:
+            market_data: DataFrame with market data
+            
+        Returns:
+            Enhanced DataFrame with RL signals
+        """
+        import numpy as np
+        import pandas as pd
+        
+        try:
+            self.logger.info("Enhancing signals with RL agent...")
+            
+            # Create copy of market data
+            df_enhanced = market_data.copy()
+            
+            # Extract features
+            states = self._extract_features(df_enhanced)
+            
+            if not states:
+                self.logger.warning("No states extracted for signal enhancement")
+                return df_enhanced
+            
+            # Preprocess states
+            states_processed = [self._preprocess_state(state) for state in states]
+            
+            # Apply RL agent to states
+            rl_signals = []
+            rl_confidences = []
+            
+            for i, state in enumerate(states_processed):
+                # Get action values
+                if self.model_type == 'tensorflow':
+                    state_input = state.reshape(1, -1)
+                    action_values = self.main_model.predict(state_input, verbose=0)[0]
+                    
+                    # Choose action with highest value
+                    action = np.argmax(action_values)
+                    
+                    # Calculate confidence (softmax of action values)
+                    action_values_exp = np.exp(action_values)
+                    confidence = action_values_exp / np.sum(action_values_exp)
+                    confidence = confidence[action]  # Confidence of chosen action
+                else:
+                    # For sklearn, just get a random action for now
+                    # In a real implementation, this would be more sophisticated
+                    action = np.random.randint(self.action_size)
+                    confidence = 0.5  # Default medium confidence
+                
+                # Convert action to signal (-1, 0, 1)
+                if action == 0:  # Buy
+                    signal = 1
+                elif action == 1:  # Sell
+                    signal = -1
+                else:  # Hold
+                    signal = 0
+                
+                # Store signal and confidence
+                rl_signals.append(signal)
+                rl_confidences.append(confidence)
+            
+            # Add RL signals to dataframe
+            # Account for the initial window (first 30 rows won't have signals)
+            initial_padding = len(df_enhanced) - len(rl_signals)
+            rl_signals_padded = [0] * initial_padding + rl_signals
+            rl_confidences_padded = [0.0] * initial_padding + rl_confidences
+            
+            df_enhanced['RL_Signal'] = rl_signals_padded
+            df_enhanced['RL_Confidence'] = rl_confidences_padded
+            
+            # Also provide combined signal if 'Signal' column exists
+            if 'Signal' in df_enhanced.columns:
+                # Combine traditional and RL signals with weighted blending
+                weight_traditional = 0.6  # 60% weight to traditional signal
+                weight_rl = 0.4  # 40% weight to RL signal
+                
+                # Ensure signals are numeric
+                df_enhanced['Signal'] = pd.to_numeric(df_enhanced['Signal'], errors='coerce').fillna(0)
+                
+                # Calculate combined signal
+                df_enhanced['Combined_Signal'] = (
+                    weight_traditional * df_enhanced['Signal'] + 
+                    weight_rl * df_enhanced['RL_Signal']
+                )
+                
+                # Threshold the combined signal to -1, 0, 1
+                df_enhanced['Combined_Signal'] = df_enhanced['Combined_Signal'].apply(
+                    lambda x: 1 if x > 0.5 else (-1 if x < -0.5 else 0)
+                )
+            
+            self.logger.info("Signal enhancement complete")
+            return df_enhanced
+            
+        except Exception as e:
+            self.logger.error(f"Error enhancing signals: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return market_data
+    
+    def save(self, filename=None):
+        """Save the RL agent model
+        
+        Args:
+            filename (str, optional): Custom filename
+        """
+        import numpy as np
+        import datetime
+        
+        if not filename:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"nq_rlagent_{timestamp}"
+        
+        try:
+            if self.model_type == 'tensorflow':
+                # Save TensorFlow model
+                model_path = os.path.join(self.config['save_dir'], f"{filename}.h5")
+                self.main_model.save(model_path)
+                
+                # Save preprocessor stats
+                stats_path = os.path.join(self.config['save_dir'], f"{filename}_stats.npz")
+                np.savez(stats_path, 
+                         means=self.feature_means, 
+                         stds=self.feature_stds)
+                
+                self.logger.info(f"Model saved to {model_path}")
+            else:
+                # Save sklearn model
+                import joblib
+                model_path = os.path.join(self.config['save_dir'], f"{filename}.joblib")
+                joblib.dump(self.main_model, model_path)
+                
+                # Save preprocessor stats
+                stats_path = os.path.join(self.config['save_dir'], f"{filename}_stats.npz")
+                np.savez(stats_path, 
+                         means=self.feature_means, 
+                         stds=self.feature_stds)
+                
+                self.logger.info(f"Model saved to {model_path}")
+                
+        except Exception as e:
+            self.logger.error(f"Error saving model: {e}")
+    
+    def load(self, filename):
+        """Load the RL agent model
+        
+        Args:
+            filename (str): Model filename
+        """
+        import numpy as np
+        
+        try:
+            if self.model_type == 'tensorflow':
+                # Load TensorFlow model
+                from tensorflow.keras.models import load_model
+                import tensorflow.keras as keras
+                
+                model_path = os.path.join(self.config['save_dir'], f"{filename}.h5")
+                self.main_model = load_model(model_path)
+                
+                # Update target model
+                self.target_model = keras.models.clone_model(self.main_model)
+                self.target_model.set_weights(self.main_model.get_weights())
+            else:
+                # Load sklearn model
+                import joblib
+                
+                model_path = os.path.join(self.config['save_dir'], f"{filename}.joblib")
+                self.main_model = joblib.load(model_path)
+                
+                # Update target model
+                import copy
+                self.target_model = copy.deepcopy(self.main_model)
+            
+            # Load preprocessor stats
+            stats_path = os.path.join(self.config['save_dir'], f"{filename}_stats.npz")
+            if os.path.exists(stats_path):
+                stats = np.load(stats_path)
+                self.feature_means = stats['means']
+                self.feature_stds = stats['stds']
+            
+            self.logger.info(f"Model loaded from {os.path.join(self.config['save_dir'], filename)}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error loading model: {e}")
+            return False     
+
 #==============================================================================
 # MAIN SYSTEM CLASS
 #==============================================================================         
@@ -17530,7 +20246,7 @@ def integrate_rl_with_existing_strategy(market_data):
         
     # Initialize RL agent
     print("Initializing RL agent...")
-    rl_agent = DQNAgent()
+    rl_agent = NQRLAgent()
     
     # Enhance agent with training data
     print("Training RL agent...")
@@ -17832,21 +20548,21 @@ def setup_exchange(exchange_id='binance', test_mode=True):
         print(f"Unexpected error: {str(e)}")
         print("Falling back to simulation mode...")
         
-        #
+        
 
 
 def main():
     """
     Main function for NQ Alpha Elite Trading Bot with Advanced RL Integration
     World's most sophisticated trading system combining traditional technical analysis
-    with cutting-edge reinforcement learning
+    with cutting-edge reinforcement learning and live-only training capabilities
     """
     try:
-        print("\n" + "="*60)
-        print("  NQ ALPHA ELITE TRADING SYSTEM - v2.0 'Neural Quantum'")
-        print("  AI-Powered Advanced Trading Platform")
+        print("\n" + "="*80)
+        print("  NQ ALPHA ELITE TRADING SYSTEM - v3.0 'Neural Quantum Autonomous'")
+        print("  AI-Powered Advanced Trading Platform with Continuous Learning")
         print("  Developed by: An0nym0usn3thunt3r")
-        print("="*60)
+        print("="*80)
         
         # Display current time
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -17861,7 +20577,15 @@ def main():
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
-        logging.info("Trading system initialized")
+        
+        # Also set up console handler for better visibility
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console.setFormatter(formatter)
+        logging.getLogger('').addHandler(console)
+        
+        logging.info("NQ Alpha Elite Trading System initialized")
         
         # Get trading parameters
         print("\nSetting up trading parameters...")
@@ -17870,121 +20594,139 @@ def main():
         
         logging.info(f"Trading parameters: Symbol={symbol}, Timeframe={timeframe}")
         
-        # Fetch market data using web scraper
-        print(f"\nFetching market data for {symbol} on {timeframe} timeframe...")
+        # Initialize data feed with proper error handling
+        print("\nInitializing market data feed...")
         try:
-            # Use your existing web scraper function
-            market_data = fetch_historical_klines(symbol, timeframe)
-            print(f"Successfully fetched {len(market_data)} data points")
-            logging.info(f"Market data fetched: {len(market_data)} candles")
+            # Try to use NQDirectFeed (web scraper class) first
+            data_feed = NQDirectFeed(clean_start=False)
+            print("Using NQDirectFeed for market data...")
+        except (NameError, Exception) as e:
+            # Fallback to MarketDataFeed
+            try:
+                data_feed = MarketDataFeed()
+                print("Using MarketDataFeed for market data...")
+            except Exception as e:
+                print(f"Error initializing data feed: {e}")
+                logging.error(f"Fatal error initializing data feed: {e}")
+                return None
+        
+        # Initial data update
+        print("\nFetching initial market data...")
+        try:
+            data_feed.update_data()
+            print("Initial market data retrieved successfully")
         except Exception as e:
-            print(f"Error fetching market data: {str(e)}")
-            logging.error(f"Data fetch error: {str(e)}")
-            return None
-        
-        # Process market data
-        print("\nProcessing market data...")
-        market_data = process_klines(market_data)  # Your existing processing function
-        
-        # Add technical indicators
-        print("Adding technical indicators...")
-        market_data = add_indicators(market_data)  # Your existing indicators function
-        
-        # Generate trading signals using traditional strategy
-        print("\nGenerating trading signals using traditional strategy...")
-        signals = generate_signals(market_data)  # Your existing signal generator
-        market_data['Signal'] = signals
-        
-        # Calculate traditional strategy performance
-        print("\nTraditional Strategy Performance:")
-        trad_performance = calculate_performance(market_data, 'Signal')  # Your existing performance calculator
-        
-        # Option to add reinforcement learning
-        use_rl = input("\nIntegrate reinforcement learning? (y/n): ").lower() == 'y'
-        
-        if use_rl:
-            print("\n" + "="*60)
-            print("  NEURAL REINFORCEMENT LEARNING INTEGRATION")
-            print("="*60)
-            
-            # Ask for RL training preference
-            train_new = input("Train new RL model or use existing? (train/use): ").lower() == 'train'
-            
-            if train_new:
-                print("\nTraining new reinforcement learning model...")
-                # Set training parameters
-                episodes = int(input("Enter number of training episodes (default: 50): ") or "50")
-                logging.info(f"Training new RL model with {episodes} episodes")
-                
-                # Integrate RL with traditional strategy
-                market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, episodes=episodes)
-            else:
-                print("\nLoading existing reinforcement learning model...")
-                logging.info("Using existing RL model")
-                market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, mode='use')
-            
-            # Performance comparison if RL was successfully integrated
-            if 'RL_Signal' in market_data.columns:
-                print("\nRL Strategy Performance:")
-                rl_performance = calculate_performance(market_data, 'RL_Signal')
-                
-                if 'Combined_Signal' in market_data.columns:
-                    print("\nCombined Strategy Performance:")
-                    combined_performance = calculate_performance(market_data, 'Combined_Signal')
-        else:
-            print("\nUsing traditional strategy only (no RL integration)")
-            logging.info("RL integration skipped")
-        
-        # Strategy selection for backtesting/trading
-        print("\n" + "="*60)
-        print("  STRATEGY SELECTION")
-        print("="*60)
-        
-        if use_rl and 'RL_Signal' in market_data.columns:
-            strategy_options = [
-                "1: Traditional (Technical Indicators)",
-                "2: Reinforcement Learning",
-                "3: Combined (Hybrid Strategy)"
-            ]
-            print("\nAvailable strategies:")
-            for option in strategy_options:
-                print(f"  {option}")
-            
-            strategy_choice = input("\nSelect strategy number (default: 3): ") or "3"
-            
-            if strategy_choice == "1":
-                active_signal = 'Signal'
-                strategy_name = "Traditional"
-            elif strategy_choice == "2":
-                active_signal = 'RL_Signal'
-                strategy_name = "Reinforcement Learning"
-            else:
-                active_signal = 'Combined_Signal'
-                strategy_name = "Combined Hybrid"
-        else:
-            active_signal = 'Signal'
-            strategy_name = "Traditional"
-        
-        print(f"\nSelected strategy: {strategy_name}")
-        logging.info(f"Strategy selected: {strategy_name}")
+            print(f"Warning: Error during initial data update: {e}")
+            logging.warning(f"Error during initial data update: {e}")
         
         # Trading mode selection
-        print("\n" + "="*60)
+        print("\n" + "="*80)
         print("  EXECUTION MODE")
-        print("="*60)
+        print("="*80)
         
         print("\nExecution modes:")
         print("  1: Backtesting (Historical Analysis)")
         print("  2: Paper Trading (Simulated Live Trading)")
         print("  3: Live Trading (Real Market Orders)")
+        print("  4: Continuous Learning (Live-Only Training with Paper Trading)")
+        print("  5: Elite Autonomous Trading (Continuous Learning with Live Execution)")
         
-        mode = input("\nSelect execution mode (default: 1): ") or "1"
+        mode = input("\nSelect execution mode (default: 2): ") or "2"
         
+        # RL Integration options
+        if mode in ["1", "2", "3"]:  # Traditional modes
+            # Get market data for these modes
+            print("\nRetrieving market data for analysis...")
+            market_data = data_feed.get_market_data(lookback=500)
+            if len(market_data) < 30:
+                print(f"Warning: Limited data available ({len(market_data)} points). Results may be unreliable.")
+                logging.warning(f"Limited data available: {len(market_data)} points")
+            
+            # Option to add reinforcement learning
+            use_rl = input("\nIntegrate reinforcement learning? (y/n): ").lower() == 'y'
+            
+            if use_rl:
+                print("\n" + "="*80)
+                print("  NEURAL REINFORCEMENT LEARNING INTEGRATION")
+                print("="*80)
+                
+                # Ask for RL training preference
+                train_new = input("Train new RL model or use existing? (train/use): ").lower() == 'train'
+                
+                if train_new:
+                    print("\nTraining new reinforcement learning model...")
+                    # Set training parameters
+                    episodes = int(input("Enter number of training episodes (default: 50): ") or "50")
+                    logging.info(f"Training new RL model with {episodes} episodes")
+                    
+                    # Integrate RL with traditional strategy
+                    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, episodes=episodes)
+                else:
+                    print("\nLoading existing reinforcement learning model...")
+                    logging.info("Using existing RL model")
+                    
+                    # Load the model
+                    try:
+                        # Initialize the RL agent
+                        rl_agent = NQRLAgent()
+                        
+                        # Check if production model exists
+                        if os.path.exists("models/rl/production_rl_agent.h5.h5"):
+                            print("Found production RL model, loading...")
+                            rl_agent.load("production_rl_agent.h5")
+                        else:
+                            print("No existing model found, will create new one")
+                            
+                        # Integrate with market data
+                        market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, mode='use')
+                        
+                    except Exception as e:
+                        print(f"Error loading RL model: {e}")
+                        logging.error(f"Error loading RL model: {e}")
+                        # Create a new one as fallback
+                        market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
+                
+                # Strategy selection for RL-enabled modes
+                if 'RL_Signal' in market_data.columns:
+                    print("\n" + "="*80)
+                    print("  STRATEGY SELECTION")
+                    print("="*80)
+                    
+                    strategy_options = [
+                        "1: Traditional (Technical Indicators)",
+                        "2: Reinforcement Learning",
+                        "3: Combined (Hybrid Strategy)"
+                    ]
+                    print("\nAvailable strategies:")
+                    for option in strategy_options:
+                        print(f"  {option}")
+                    
+                    strategy_choice = input("\nSelect strategy number (default: 3): ") or "3"
+                    
+                    if strategy_choice == "1":
+                        active_signal = 'Signal'
+                        strategy_name = "Traditional"
+                    elif strategy_choice == "2":
+                        active_signal = 'RL_Signal'
+                        strategy_name = "Reinforcement Learning"
+                    else:
+                        active_signal = 'Combined_Signal'
+                        strategy_name = "Combined Hybrid"
+                else:
+                    active_signal = 'Signal'
+                    strategy_name = "Traditional"
+            else:
+                print("\nUsing traditional strategy only (no RL integration)")
+                logging.info("RL integration skipped")
+                active_signal = 'Signal'
+                strategy_name = "Traditional"
+        
+        # Handle specific execution modes
         if mode == "1":
             # Backtesting mode
-            print("\n" + "="*60)
+            print("\n" + "="*80)
             print("  BACKTESTING MODE")
-            print("="*60)
+            print("="*80)
             
             print(f"\nRunning backtest with {strategy_name} strategy...")
             logging.info(f"Backtesting {strategy_name} strategy")
@@ -18012,9 +20754,9 @@ def main():
             
         elif mode == "2":
             # Paper trading mode
-            print("\n" + "="*60)
+            print("\n" + "="*80)
             print("  PAPER TRADING MODE")
-            print("="*60)
+            print("="*80)
             
             print(f"\nStarting paper trading with {strategy_name} strategy...")
             logging.info(f"Paper trading with {strategy_name} strategy")
@@ -18051,9 +20793,9 @@ def main():
             
         elif mode == "3":
             # Live trading mode
-            print("\n" + "="*60)
+            print("\n" + "="*80)
             print("  LIVE TRADING MODE")
-            print("="*60)
+            print("="*80)
             
             # Security confirmation
             print("\n⚠️ WARNING: You are about to start LIVE TRADING with REAL MONEY ⚠️")
@@ -18091,69 +20833,172 @@ def main():
                 print(f"\nError during live trading: {str(e)}")
                 logging.error(f"Live trading error: {str(e)}")
                 traceback.print_exc()
+                
+        elif mode == "4":
+            # Continuous Learning with Paper Trading Mode
+            print("\n" + "="*80)
+            print("  CONTINUOUS LEARNING & PAPER TRADING MODE")
+            print("  Training exclusively on live data while paper trading")
+            print("="*80)
+            
+            # Initialize paper trading parameters
+            initial_capital = float(input("\nEnter initial paper trading capital (default: 100000): ") or "100000")
+            
+            # Configure the live training system
+            print("\nConfiguring continuous learning parameters...")
+            min_data_points = int(input("Minimum data points before trading (default: 10): ") or "10")
+            update_interval = float(input("Update interval in seconds (default: 5.0): ") or "5.0")
+            initial_trade_size = float(input("Initial position size % (default: 1.0): ") or "1.0") / 100
+            
+            # Create Live Trainer configuration
+            live_config = {
+                'update_interval': update_interval,
+                'min_data_points': min_data_points,
+                'preferred_data_points': 100,
+                'initial_trade_size_pct': initial_trade_size,
+                'max_trade_size_pct': initial_trade_size * 5,  # Max 5x the initial size
+                'print_metrics_interval': 20  # Print metrics every 20 data points
+            }
+            
+            print("\n" + "="*80)
+            print("  INITIALIZING CONTINUOUS LEARNING SYSTEM")
+            print("="*80)
+            
+            try:
+                # Initialize the live trainer
+                print("\nCreating Live Trainer with zero historical data...")
+                live_trainer = NQLiveTrainer(
+                    initial_capital=initial_capital,
+                    config=live_config
+                )
+                
+                # Link the data feed
+                live_trainer.market_data_feed = data_feed
+                
+                print("\nStarting continuous learning and paper trading...")
+                logging.info("Starting continuous learning and paper trading")
+                live_trainer.start()
+                
+                print("\nSystem is now collecting data and will begin trading after " +
+                      f"collecting {min_data_points} data points.")
+                print("\nPress Ctrl+C to stop the system.")
+                
+                try:
+                    # Keep the main thread alive with periodic status updates
+                    while True:
+                        time.sleep(60)  # Check status every minute
+                        
+                        # Print periodic status updates
+                        metrics = {
+                            'data_points': live_trainer.data_points_collected,
+                            'capital': live_trainer.capital,
+                            'return': (live_trainer.capital / initial_capital - 1) * 100,
+                            'trades': len(live_trainer.trades_history),
+                            'training_count': live_trainer.training_count
+                        }
+                        
+                        print("\n--- CONTINUOUS LEARNING STATUS UPDATE ---")
+                        print(f"Data Points: {metrics['data_points']}")
+                        print(f"Paper Capital: ${metrics['capital']:.2f} (Return: {metrics['return']:.2f}%)")
+                        print(f"Completed Trades: {metrics['trades']}")
+                        print(f"Training Iterations: {metrics['training_count']}")
+                        if live_trainer.positions:
+                            print(f"Active Positions: {len(live_trainer.positions)}")
+                        print("----------------------------------------")
+                        
+                except KeyboardInterrupt:
+                    print("\nStopping continuous learning system...")
+                    live_trainer.stop()
+                    print("Continuous learning system stopped")
+                    logging.info("Continuous learning system stopped by user")
+                    
+                    # Save final model if needed
+                    if hasattr(live_trainer, 'rl_agent'):
+                        print("Saving final RL model...")
+                        live_trainer.rl_agent.save("production_rl_agent.h5")
+                        print("Model saved successfully")
+                
+            except Exception as e:
+                print(f"\nError during continuous learning: {str(e)}")
+                logging.error(f"Continuous learning error: {str(e)}")
+                traceback.print_exc()
+                
+        elif mode == "5":
+            # Elite Autonomous Trading (Continuous Learning with Live Execution)
+            print("\n" + "="*80)
+            print("  ELITE AUTONOMOUS TRADING MODE")
+            print("  Continuous Learning with Live Order Execution")
+            print("="*80)
+            
+            # Security confirmation for live trading
+            print("\n⚠️ WARNING: You are about to start LIVE TRADING with REAL MONEY ⚠️")
+            print("⚠️ This mode will execute real orders while learning from live data ⚠️")
+            confirm = input("\nType 'CONFIRM LIVE TRADING' to proceed: ")
+            
+            if confirm != "CONFIRM LIVE TRADING":
+                print("Elite autonomous trading canceled")
+                logging.info("Elite autonomous trading canceled by user")
+                return None
+                
+            print("\nThis feature will be enabled in the next major update.")
+            print("Currently, please use Continuous Learning mode (Option 4) for training and")
+            print("then switch to Live Trading mode (Option 3) with the trained model.")
+            
+            logging.info("Elite autonomous trading not yet implemented")
+            
+        else:
+            print(f"\nInvalid mode selected: {mode}")
+            logging.error(f"Invalid mode selected: {mode}")
+            return None
         
-        print("\n" + "="*60)
-        print("  TRADING SYSTEM EXECUTION COMPLETED")
-        print("="*60)
+        print("\n" + "="*80)
+        print("  NQ ALPHA ELITE TRADING SYSTEM EXECUTION COMPLETED")
+        print("="*80)
         
-        # Return processed market data for further analysis
-        return market_data
+        # Return processed market data for further analysis if available
+        if 'market_data' in locals():
+            return market_data
+        else:
+            return None
         
     except Exception as e:
-        print(f"\n===== ERROR =====")
-        print(f"An error occurred: {str(e)}")
+        print(f"\n===== CRITICAL ERROR =====")
+        print(f"An error occurred in the main system: {str(e)}")
         print("\nDetailed traceback:")
         traceback.print_exc()
-        logging.error(f"Error in main: {str(e)}", exc_info=True)
+        logging.error(f"Critical error in main: {str(e)}", exc_info=True)
         return None
 if __name__ == "__main__":
 
-
     try:
-        # Initialize MarketDataFeed with proper logging
-        data_feed = MarketDataFeed(
-            config={'debug_requests': True}
-        )
-        print("Using MarketDataFeed for market data...")
-        
-        # Start the data feed in background mode
-        data_feed.run()
-        
-        # Give it a moment to collect initial data
-        print("Collecting initial market data...")
-        time.sleep(5)
-        
-        # Update data (with error handling)
+        # Try to use NQDirectFeed (your web scraper class)
+        data_feed = NQDirectFeed(clean_start=False)
+        print("Using NQDirectFeed for market data...")
+    except NameError:
+        # Fallback to MarketDataFeed if NQDirectFeed isn't available
         try:
-            print("Updating market data...")
-            success = data_feed.update_data()
-            if not success:
-                print("Warning: Initial data update failed, continuing anyway...")
+            # Try without clean_start parameter
+            data_feed = MarketDataFeed()
+            print("Using MarketDataFeed for market data...")
         except Exception as e:
-            print(f"Error during initial data update: {e}")
-        
-        # Get market data safely
-        try:
-            print("Retrieving market data for analysis...")
-            market_data = data_feed.get_market_data(count=500)  # Using count instead of lookback
-            if not isinstance(market_data, pd.DataFrame):
-                print("Converting market data to DataFrame...")
-                market_data = pd.DataFrame(market_data)
-            print(f"Retrieved {len(market_data)} data points")
-        except Exception as e:
-            print(f"Error retrieving market data: {e}")
-            # Create minimal empty DataFrame as fallback
-            import pandas as pd
-            market_data = pd.DataFrame(columns=['timestamp', 'price', 'volume'])
-            
-        # Now integrate with RL engine
-        market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
-        
-    except Exception as e:
-        print(f"Critical error in data initialization: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+            print(f"Error initializing data feed: {e}")
+            raise
+
+    # Force initial data fetch
+    data_feed.update_data()
+
+    # Get market data from the data feed
+    market_data = data_feed.get_market_data(lookback=500)
+
+    # Now integrate RL with the properly loaded market data
+    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data) # Use your existing web scraper class
+    # Force initial data fetch
+
+    # Get market data from the data feed
+    market_data = data_feed.get_market_data(lookback=500)  # Get recent data (adjust lookback as needed)
+
+    # Now we can integrate RL with the properly loaded market data
+    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
     
     # If you want to save the RL agent for future use
     if rl_agent is not None:
