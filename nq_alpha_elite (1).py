@@ -11,7 +11,6 @@ import sys
 import time
 import logging
 import threading
-import datetime
 import signal
 import argparse
 import json
@@ -33,6 +32,17 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import IsolationForest
 import matplotlib.pyplot as plt
 import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
+from collections import deque
+from tensorflow.keras.layers import Dense, Input, LSTM, Dropout, Concatenate, BatchNormalization
+import tensorflow_probability as tfp
+import joblib
+import os
+from datetime import datetime
+import json
+import traceback
 try:
     from nq_alpha_rl import NQAlphaEliteRL, PPOAgent
     RL_AVAILABLE = True
@@ -55,12 +65,571 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f"logs/elite_system_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        logging.FileHandler(f"logs/elite_system_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     ]
 )
 
 # Global logger
 logger = logging.getLogger("NQAlpha")
+
+
+
+class PrioritizedReplayBuffer:
+    """Advanced experience replay buffer for more efficient learning"""
+    
+    def __init__(self, max_size=10000, alpha=0.6, beta=0.4):
+        self.max_size = max_size
+        self.buffer = []
+        self.priorities = []
+        self.position = 0
+        self.alpha = alpha  # prioritization strength
+        self.beta = beta    # importance sampling weight
+        self.max_priority = 1.0
+    
+    def add(self, state, action, reward, next_state, done):
+        """Add experience with max priority"""
+        if len(self.buffer) < self.max_size:
+            self.buffer.append((state, action, reward, next_state, done))
+            self.priorities.append(self.max_priority)
+        else:
+            self.buffer[self.position] = (state, action, reward, next_state, done)
+            self.priorities[self.position] = self.max_priority
+            
+        self.position = (self.position + 1) % self.max_size
+    
+    def sample(self, batch_size):
+        """Sample a batch based on priorities"""
+        if len(self.buffer) < batch_size:
+            batch_size = len(self.buffer)
+            
+        # Calculate sampling probabilities
+        priorities = np.array(self.priorities)
+        prob_alpha = priorities ** self.alpha
+        probs = prob_alpha / prob_alpha.sum()
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        
+        # Calculate importance sampling weights
+        weights = (len(self.buffer) * probs[indices]) ** (-self.beta)
+        weights /= weights.max()  # normalize
+        
+        # Collect experiences
+        states, actions, rewards, next_states, dones = [], [], [], [], []
+        
+        for idx in indices:
+            state, action, reward, next_state, done = self.buffer[idx]
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
+        
+        return (
+            np.array(states),
+            np.array(actions),
+            np.array(rewards, dtype=np.float32),
+            np.array(next_states),
+            np.array(dones, dtype=np.float32),
+            indices,
+            np.array(weights, dtype=np.float32)
+        )
+    
+    def update_priority(self, idx, priority):
+        """Update priority for an experience"""
+        priority = max(priority, 1e-5)  # avoid zero priority
+        self.priorities[idx] = priority
+        self.max_priority = max(self.max_priority, priority)
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class RLTradingAgent:
+    """Advanced reinforcement learning agent for trading"""
+    
+    def __init__(self, state_size, action_size, learning_rate=0.0001):
+        self.state_size = state_size
+        self.action_size = action_size
+        
+        # Hyperparameters
+        self.gamma = 0.99           # Discount factor
+        self.epsilon = 1.0          # Exploration rate
+        self.epsilon_min = 0.01     # Minimum exploration rate
+        self.epsilon_decay = 0.995  # Exploration decay rate
+        self.learning_rate = learning_rate
+        
+        # Experience buffer
+        self.memory = PrioritizedReplayBuffer(max_size=50000)
+        self.batch_size = 64
+        
+        # Build neural network models
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+        
+        # Performance tracking
+        self.train_count = 0
+        self.profits = []
+        self.trade_history = []
+        
+        # Create logging directory
+        self.log_dir = "rl_trading_logs"
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_file = os.path.join(self.log_dir, f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        with open(self.log_file, 'w') as f:
+            f.write("step,reward,profit,loss,epsilon\n")
+    
+    def _build_model(self):
+        """Build deep neural network model"""
+        model = Sequential()
+        
+        # First layer with batch normalization
+        model.add(Dense(128, input_dim=self.state_size))
+        model.add(BatchNormalization())
+        model.add(Dense(128, activation='relu'))
+        
+        # Hidden layers
+        model.add(Dense(64, activation='relu'))
+        model.add(Dropout(0.2))  # Add dropout for regularization
+        model.add(Dense(64, activation='relu'))
+        
+        # Output layer - Q-values for each action
+        model.add(Dense(self.action_size, activation='linear'))
+        
+        # Compile model
+        model.compile(
+            optimizer=Adam(learning_rate=self.learning_rate),
+            loss='mse'
+        )
+        
+        return model
+    
+    def update_target_model(self):
+        """Update target model to match main model"""
+        self.target_model.set_weights(self.model.get_weights())
+    
+    def remember(self, state, action, reward, next_state, done):
+        """Store experience in memory"""
+        self.memory.add(state, action, reward, next_state, done)
+    
+    def act(self, state, training=True):
+        """Select action based on current state"""
+        if training and np.random.rand() <= self.epsilon:
+            # Exploration: random action
+            return random.randrange(self.action_size)
+        
+        # Exploitation: predict best action
+        q_values = self.model.predict(state, verbose=0)[0]
+        return np.argmax(q_values)
+    
+    def replay(self, batch_size):
+        """Train on batch of experiences"""
+        if len(self.memory) < batch_size:
+            return
+        
+        # Sample batch from memory
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(batch_size)
+        
+        # Predict Q-values for current states
+        targets = self.model.predict(states, verbose=0)
+        
+        # Predict Q-values for next states using target network
+        next_q_values = self.target_model.predict(next_states, verbose=0)
+        
+        # Calculate target Q-values (Bellman equation)
+        for i in range(batch_size):
+            if dones[i]:
+                targets[i, actions[i]] = rewards[i]
+            else:
+                targets[i, actions[i]] = rewards[i] + self.gamma * np.max(next_q_values[i])
+        
+        # Calculate TD errors for priority updates
+        pred_q_values = self.model.predict(states, verbose=0)
+        td_errors = np.abs(np.choose(actions, targets.T) - np.choose(actions, pred_q_values.T))
+        
+        # Update priorities in replay buffer
+        for i, idx in enumerate(indices):
+            self.memory.update_priority(idx, td_errors[i])
+        
+        # Train the model
+        history = self.model.fit(states, targets, epochs=1, verbose=0, sample_weight=weights)
+        loss = history.history['loss'][0]
+        
+        # Decay exploration rate
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+        
+        # Update target model occasionally
+        self.train_count += 1
+        if self.train_count % 100 == 0:
+            self.update_target_model()
+            
+        return loss
+    
+    def save_model(self, filepath):
+        """Save model weights"""
+        self.model.save_weights(filepath)
+        print(f"Model saved to {filepath}")
+    
+    def load_model(self, filepath):
+        """Load model weights"""
+        self.model.load_weights(filepath)
+        self.target_model.load_weights(filepath)
+        print(f"Model loaded from {filepath}")
+    
+    def log_performance(self, step, reward, profit, loss=0):
+        """Log trading performance"""
+        with open(self.log_file, 'a') as f:
+            f.write(f"{step},{reward},{profit},{loss},{self.epsilon}\n")
+        
+        # Store profit for tracking
+        self.profits.append(profit)
+        
+        # Print summary every 10 steps
+        if step % 10 == 0:
+            avg_profit = np.mean(self.profits[-100:]) if self.profits else 0
+            win_rate = np.mean([p > 0 for p in self.profits[-100:]]) if self.profits else 0
+            print(f"Step {step}: Reward={reward:.2f}, Profit={profit:.2%}, Win Rate={win_rate:.2%}, Epsilon={self.epsilon:.4f}")
+
+class OnlinePPOAgent:
+    """Advanced PPO agent with online learning capabilities"""
+    
+    def __init__(self, state_size, action_size, lr=0.0001):
+        self.state_size = state_size
+        self.action_size = action_size
+        
+        # Hyperparameters
+        self.lr = lr
+        self.gamma = 0.99  # discount factor
+        self.clip_ratio = 0.2  # PPO clip ratio
+        self.lam = 0.95  # GAE lambda
+        self.update_epochs = 4
+        self.entropy_coef = 0.01
+        
+        # Experience buffer
+        self.buffer_size = 10000
+        self.min_buffer_size = 1000  # Min experiences before training
+        self.batch_size = 256
+        
+        # Experience buffer
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.logprobs = []
+        self.dones = []
+        
+        # Experience replay for offline learning
+        self.replay_buffer = PrioritizedReplayBuffer(max_size=self.buffer_size)
+        
+        # Performance tracking
+        self.train_iterations = 0
+        self.total_rewards = []
+        self.avg_rewards = []
+        self.win_rate = []
+        
+        # Networks
+        self._build_model()
+        
+        # Adaptive learning rate
+        self.lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=self.lr,
+            decay_steps=10000,
+            decay_rate=0.95,
+            staircase=True
+        )
+        
+        # Create optimizer
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_schedule)
+        
+        # Training log
+        self.log_dir = "trading_bot_logs"
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_file = os.path.join(self.log_dir, f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        with open(self.log_file, 'w') as f:
+            f.write("iteration,avg_reward,win_rate,learning_rate\n")
+    
+    def _build_model(self):
+        """Build actor and critic networks with shared layers"""
+        # Feature extraction layers (shared)
+        state_input = Input(shape=(self.state_size,))
+        
+        # Shared network
+        shared = Dense(128, activation='relu')(state_input)
+        shared = BatchNormalization()(shared)
+        shared = Dense(128, activation='relu')(shared)
+        shared = BatchNormalization()(shared)
+        
+        # Policy network (actor)
+        policy_hidden = Dense(64, activation='relu')(shared)
+        policy_out = Dense(self.action_size, activation='softmax')(policy_hidden)
+        
+        # Value network (critic)
+        value_hidden = Dense(64, activation='relu')(shared)
+        value_out = Dense(1)(value_hidden)
+        
+        # Create models
+        self.actor = Model(inputs=state_input, outputs=policy_out)
+        self.critic = Model(inputs=state_input, outputs=value_out)
+        
+        # Print model summaries
+        self.actor.summary()
+        self.critic.summary()
+    
+    def get_action(self, state, training=True):
+        """Sample an action from the policy distribution"""
+        # Ensure state is correctly shaped
+        if len(state.shape) == 1:
+            state = np.expand_dims(state, axis=0)
+            
+        # Get action probabilities
+        probs = self.actor.predict(state, verbose=0)[0]
+        
+        # Calculate state value
+        value = self.critic.predict(state, verbose=0)[0][0]
+        
+        if training:
+            # Sample action from distribution
+            action = np.random.choice(self.action_size, p=probs)
+            log_prob = np.log(probs[action] + 1e-10)
+            return action, log_prob, value, probs
+        else:
+            # Deterministic action (e.g., for trading)
+            action = np.argmax(probs)
+            return action
+    
+    def remember(self, state, action, reward, next_state, done, log_prob=None, value=None):
+        """Store experience in replay buffer"""
+        # For immediate PPO training
+        if log_prob is not None and value is not None:
+            self.states.append(state)
+            self.actions.append(action)
+            self.rewards.append(reward)
+            self.values.append(value)
+            self.logprobs.append(log_prob)
+            self.dones.append(float(done))
+        
+        # For experience replay (offline learning)
+        self.replay_buffer.add(state, action, reward, next_state, done)
+    
+    def _calculate_advantages(self):
+        """Calculate advantages using Generalized Advantage Estimation (GAE)"""
+        advantages = np.zeros_like(self.rewards, dtype=np.float32)
+        returns = np.zeros_like(self.rewards, dtype=np.float32)
+        
+        last_gae = 0
+        last_return = 0
+        
+        # Calculate advantages in reverse order
+        for t in reversed(range(len(self.rewards))):
+            # For last step
+            if t == len(self.rewards) - 1:
+                # If episode didn't finish, bootstrap value
+                if not self.dones[t]:
+                    # Bootstrap with critic value
+                    next_state = np.expand_dims(self.states[t], axis=0)
+                    next_value = self.critic.predict(next_state, verbose=0)[0][0]
+                else:
+                    next_value = 0
+            else:
+                next_value = self.values[t + 1]
+            
+            # Calculate TD error
+            delta = self.rewards[t] + self.gamma * next_value * (1 - self.dones[t]) - self.values[t]
+            
+            # Calculate GAE
+            advantages[t] = last_gae = delta + self.gamma * self.lam * (1 - self.dones[t]) * last_gae
+            
+            # Calculate returns for critic
+            returns[t] = last_return = self.rewards[t] + self.gamma * (1 - self.dones[t]) * last_return
+        
+        return returns, advantages
+    
+    def train_from_buffer(self):
+        """Train agent from current experience buffer"""
+        if len(self.states) < self.batch_size:
+            return
+        
+        # Convert lists to numpy arrays
+        states = np.array(self.states)
+        actions = np.array(self.actions)
+        old_log_probs = np.array(self.logprobs)
+        
+        # Calculate advantages and returns
+        returns, advantages = self._calculate_advantages()
+        
+        # Normalize advantages for stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # PPO optimization loop
+        for _ in range(self.update_epochs):
+            # Create random indices
+            indices = np.random.permutation(len(states))
+            
+            # Process in minibatches
+            for start in range(0, len(states), self.batch_size):
+                end = start + self.batch_size
+                if end > len(states):
+                    end = len(states)
+                
+                # Get minibatch indices
+                mb_indices = indices[start:end]
+                
+                with tf.GradientTape() as tape:
+                    # Get current action probabilities and values
+                    curr_probs = self.actor(states[mb_indices])
+                    curr_values = self.critic(states[mb_indices])
+                    
+                    # Get one-hot actions
+                    actions_one_hot = tf.one_hot(actions[mb_indices], self.action_size)
+                    
+                    # Calculate probabilities of actions taken
+                    curr_action_probs = tf.reduce_sum(curr_probs * actions_one_hot, axis=1)
+                    
+                    # Calculate log probabilities
+                    curr_log_probs = tf.math.log(curr_action_probs + 1e-10)
+                    
+                    # Probability ratio
+                    ratio = tf.exp(curr_log_probs - old_log_probs[mb_indices])
+                    
+                    # Clipped objective
+                    clip_adv = tf.clip_by_value(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * advantages[mb_indices]
+                    policy_loss = -tf.reduce_mean(tf.minimum(ratio * advantages[mb_indices], clip_adv))
+                    
+                    # Value loss
+                    value_loss = tf.reduce_mean(tf.square(returns[mb_indices] - tf.squeeze(curr_values)))
+                    
+                    # Entropy bonus for exploration
+                    entropy = -tf.reduce_mean(tf.reduce_sum(curr_probs * tf.math.log(curr_probs + 1e-10), axis=1))
+                    
+                    # Total loss
+                    loss = policy_loss + 0.5 * value_loss - self.entropy_coef * entropy
+                
+                # Compute gradients
+                grads = tape.gradient(loss, self.actor.trainable_variables + self.critic.trainable_variables)
+                
+                # Apply gradients
+                self.optimizer.apply_gradients(zip(grads, self.actor.trainable_variables + self.critic.trainable_variables))
+        
+        # Clear experience buffer
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.logprobs = []
+        self.dones = []
+        
+        # Track training
+        self.train_iterations += 1
+        
+        # Log training (every 10 iterations)
+        if self.train_iterations % 10 == 0:
+            self._log_training()
+    
+    def train_offline_batch(self, batch_size=None):
+        """Train agent from replay buffer (offline learning)"""
+        if batch_size is None:
+            batch_size = self.batch_size
+            
+        if len(self.replay_buffer) < self.min_buffer_size:
+            return
+        
+        # Sample batch from replay buffer
+        states, actions, rewards, next_states, dones, indices, weights = self.replay_buffer.sample(batch_size)
+        
+        # Compute TD errors for prioritized replay update
+        current_values = self.critic.predict(states, verbose=0).flatten()
+        next_values = self.critic.predict(next_states, verbose=0).flatten()
+        
+        # Calculate targets for critic
+        targets = rewards + self.gamma * next_values * (1 - dones)
+        td_errors = np.abs(targets - current_values)
+        
+        # Update priorities
+        for i, idx in enumerate(indices):
+            self.replay_buffer.update_priority(idx, td_errors[i])
+        
+        # Prepare data for PPO
+        self.states = list(states)
+        self.actions = list(actions)
+        self.rewards = list(rewards)
+        self.values = list(current_values)
+        
+        # Get log probs for old actions
+        log_probs = []
+        for i in range(len(states)):
+            probs = self.actor.predict(np.expand_dims(states[i], axis=0), verbose=0)[0]
+            log_probs.append(np.log(probs[actions[i]] + 1e-10))
+            
+        self.logprobs = log_probs
+        self.dones = list(dones)
+        
+        # Train using PPO
+        self.train_from_buffer()
+    
+    def _log_training(self):
+        """Log training progress"""
+        avg_reward = np.mean(self.total_rewards[-100:]) if self.total_rewards else 0
+        win_rate = np.mean([r > 0 for r in self.total_rewards[-100:]]) if self.total_rewards else 0
+        
+        # Store metrics
+        self.avg_rewards.append(avg_reward)
+        self.win_rate.append(win_rate)
+        
+        # Get current learning rate
+        lr = self.optimizer._decayed_lr(tf.float32).numpy()
+        
+        # Log to file
+        with open(self.log_file, 'a') as f:
+            f.write(f"{self.train_iterations},{avg_reward},{win_rate},{lr}\n")
+        
+        print(f"Iteration {self.train_iterations} | Avg Reward: {avg_reward:.4f} | Win Rate: {win_rate:.4f} | LR: {lr:.6f}")
+    
+    def save(self, actor_path="ppo_actor.h5", critic_path="ppo_critic.h5", buffer_path="replay_buffer.pkl"):
+        """Save model and replay buffer"""
+        self.actor.save_weights(actor_path)
+        self.critic.save_weights(critic_path)
+        
+        # Save replay buffer
+        with open(buffer_path, 'wb') as f:
+            joblib.dump(self.replay_buffer, f)
+        
+        # Save metrics and hyperparameters
+        metrics = {
+            "train_iterations": self.train_iterations,
+            "avg_rewards": self.avg_rewards,
+            "win_rate": self.win_rate,
+            "hyperparameters": {
+                "lr": self.lr,
+                "gamma": self.gamma,
+                "clip_ratio": self.clip_ratio,
+                "lam": self.lam,
+                "entropy_coef": self.entropy_coef
+            }
+        }
+        
+        with open("agent_metrics.json", 'w') as f:
+            json.dump(metrics, f)
+    
+    def load(self, actor_path="ppo_actor.h5", critic_path="ppo_critic.h5", buffer_path="replay_buffer.pkl"):
+        """Load model and replay buffer"""
+        if os.path.exists(actor_path):
+            self.actor.load_weights(actor_path)
+        
+        if os.path.exists(critic_path):
+            self.critic.load_weights(critic_path)
+        
+        if os.path.exists(buffer_path):
+            with open(buffer_path, 'rb') as f:
+                self.replay_buffer = joblib.load(f)
+        
+        if os.path.exists("agent_metrics.json"):
+            with open("agent_metrics.json", 'r') as f:
+                metrics = json.load(f)
+                self.train_iterations = metrics["train_iterations"]
+                self.avg_rewards = metrics["avg_rewards"]
+                self.win_rate = metrics["win_rate"]
 
 #==============================================================================
 # MARKET DATA MODULE
@@ -2867,7 +3436,56 @@ class StrategyManager:
 #==============================================================================
 # DYNAMIC TRADE MANAGER
 #==============================================================================
-
+# --- RL AGENT CLASS ---
+class DQNAgent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=2000)
+        self.gamma = 0.95  # discount rate
+        self.epsilon = 1.0  # exploration rate
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.001
+        self.model = self._build_model()
+        
+    def _build_model(self):
+        model = Sequential()
+        model.add(Dense(64, input_dim=self.state_size, activation='relu'))
+        model.add(Dropout(0.2))
+        model.add(Dense(64, activation='relu'))
+        model.add(Dropout(0.2))
+        model.add(Dense(self.action_size, activation='linear'))
+        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+        return model
+    
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        act_values = self.model.predict(state, verbose=0)
+        return np.argmax(act_values[0])
+    
+    def replay(self, batch_size):
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                target = reward + self.gamma * np.amax(self.model.predict(next_state, verbose=0)[0])
+            target_f = self.model.predict(state, verbose=0)
+            target_f[0][action] = target
+            self.model.fit(state, target_f, epochs=1, verbose=0)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            
+    def load(self, name):
+        self.model.load_weights(name)
+        
+    def save(self, name):
+        self.model.save_weights(name)
+# --- END RL AGENT CLASS ---
 class DynamicTradeManager:
     """Advanced position management with dynamic stop losses and profit targets"""
     
@@ -5446,7 +6064,284 @@ class NQAlphaEliteRL:
             # Gradually reduce exploration as system learns
             self.exploration_rate = max(0.05, self.exploration_rate * 0.995)
 
-
+def execute_live_trade_with_learning(symbol, timeframe='1h', quantity=None, api_key=None, api_secret=None):
+    """Execute trades with real-time learning from paper trading"""
+    print(f"Starting live trading with online learning for {symbol}...")
+    
+    # Initialize client if credentials provided
+    client = None
+    if api_key and api_secret:
+        from binance.client import Client
+        client = Client(api_key, api_secret)
+    
+    # Load agent if exists
+    agent_exists = os.path.exists("trading_agent_actor_latest.h5")
+    
+    # Initialize variables
+    position = 0
+    entry_price = 0
+    trade_count = 0
+    max_drawdown = 0
+    lookback = 20
+    trades = []
+    equity_curve = [1000]  # Starting equity
+    
+    try:
+        while True:
+            # Get latest klines
+            if client:
+                klines = client.get_klines(symbol=symbol, interval=timeframe, limit=100)
+                df = process_klines(klines)  # Use your existing kline processing function
+            else:
+                # Simulate with yfinance or other data source if no API credentials
+                import yfinance as yf
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period="7d", interval=timeframe)
+                df.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits']
+            
+            # Add technical indicators (use your existing indicator functions)
+            df['RSI'] = calculate_rsi(df['Close'], 14)
+            
+            # Skip if not enough data
+            if len(df) <= lookback:
+                print("Not enough data, waiting...")
+                time.sleep(60)
+                continue
+            
+            # Current index is the last available data
+            current_idx = len(df) - 1
+            
+            # Create state
+            state = create_market_state(df, current_idx, lookback)
+            if state is None:
+                print("Cannot create state, waiting...")
+                time.sleep(60)
+                continue
+            
+            # Initialize or get RL agent
+            global rl_agent
+            if 'rl_agent' not in globals() or rl_agent is None:
+                state_size = len(state)
+                action_size = 3  # Sell, Hold, Buy
+                
+                if agent_exists:
+                    print("Loading existing RL agent")
+                    rl_agent = OnlinePPOAgent(state_size, action_size)
+                    rl_agent.load("trading_agent_actor_latest.h5", "trading_agent_critic_latest.h5")
+                else:
+                    print("Creating new RL agent")
+                    rl_agent = OnlinePPOAgent(state_size, action_size)
+            
+            # Get action
+            action, log_prob, value, probs = rl_agent.get_action(state)
+            
+            # Current market data
+            current_price = df['Close'].iloc[-1]
+            
+            # Determine trading action
+            new_position = position
+            
+            if action == 0:  # Sell
+                if position == 1:  # Close long
+                    print(f"CLOSING LONG at {current_price}")
+                    # Execute sell
+                    if quantity and client:
+                        try:
+                            client.create_order(
+                                symbol=symbol,
+                                side='SELL',
+                                type='MARKET',
+                                quantity=quantity
+                            )
+                        except Exception as e:
+                            print(f"Order execution error: {e}")
+                    
+                    # Record trade
+                    profit = (current_price - entry_price) / entry_price
+                    trades.append({
+                        'type': 'CLOSE LONG',
+                        'entry': entry_price,
+                        'exit': current_price,
+                        'profit': profit,
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    print(f"Trade profit: {profit:.2%}")
+                    
+                    new_position = 0
+                elif position == 0:  # Open short
+                    print(f"OPENING SHORT at {current_price}")
+                    # Execute short
+                    if quantity and client:
+                        try:
+                            client.create_order(
+                                symbol=symbol,
+                                side='SELL',
+                                type='MARKET',
+                                quantity=quantity
+                            )
+                        except Exception as e:
+                            print(f"Order execution error: {e}")
+                    
+                    new_position = -1
+                    entry_price = current_price
+            
+            elif action == 2:  # Buy
+                if position == -1:  # Close short
+                    print(f"CLOSING SHORT at {current_price}")
+                    # Execute buy
+                    if quantity and client:
+                        try:
+                            client.create_order(
+                                symbol=symbol,
+                                side='BUY',
+                                type='MARKET',
+                                quantity=quantity
+                            )
+                        except Exception as e:
+                            print(f"Order execution error: {e}")
+                    
+                    # Record trade
+                    profit = (entry_price - current_price) / entry_price
+                    trades.append({
+                        'type': 'CLOSE SHORT',
+                        'entry': entry_price,
+                        'exit': current_price,
+                        'profit': profit,
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    print(f"Trade profit: {profit:.2%}")
+                    
+                    new_position = 0
+                elif position == 0:  # Open long
+                    print(f"OPENING LONG at {current_price}")
+                    # Execute buy
+                    if quantity and client:
+                        try:
+                            client.create_order(
+                                symbol=symbol,
+                                side='BUY',
+                                type='MARKET',
+                                quantity=quantity
+                            )
+                        except Exception as e:
+                            print(f"Order execution error: {e}")
+                    
+                    new_position = 1
+                    entry_price = current_price
+            
+            # Track trade count for overtrading penalty
+            if position != new_position:
+                trade_count += 1
+            else:
+                trade_count = max(0, trade_count - 0.1)  # Gradually decay
+            
+            # Update position
+            old_position = position
+            position = new_position
+            
+            # Wait for next candle to calculate reward
+            print(f"Waiting for next candle to calculate reward...")
+            time.sleep(60)  # Wait a minute
+            
+            # Get updated data with next candle
+            if client:
+                klines = client.get_klines(symbol=symbol, interval=timeframe, limit=100)
+                updated_df = process_klines(klines)
+            else:
+                import yfinance as yf
+                ticker = yf.Ticker(symbol)
+                updated_df = ticker.history(period="7d", interval=timeframe)
+                updated_df.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits']
+            
+            # Skip if no new data
+            if len(updated_df) <= len(df):
+                print("No new data yet, continuing...")
+                continue
+            
+            # Get next price
+            next_price = updated_df['Close'].iloc[-1]
+            
+            # Calculate reward
+            reward, _, _ = calculate_reward(
+                action, old_position, entry_price, current_price, next_price,
+                trade_count, max_drawdown
+            )
+            
+            # Update equity curve
+            if old_position == 1:
+                pnl = (next_price - current_price) / current_price
+            elif old_position == -1:
+                pnl = (current_price - next_price) / current_price
+            else:
+                pnl = 0
+                
+            equity_curve.append(equity_curve[-1] * (1 + pnl))
+            
+            # Calculate drawdown
+            peak = max(equity_curve)
+            current_dd = (equity_curve[-1] / peak) - 1
+            max_drawdown = min(max_drawdown, current_dd)
+            
+            # Create next state
+            next_state = create_market_state(updated_df, len(updated_df)-1, lookback)
+            
+            # Online learning
+            if next_state is not None:
+                print(f"Learning from experience: Action={action}, Reward={reward:.4f}")
+                rl_agent.remember(state, action, reward, next_state, False, log_prob, value)
+                
+                # Train occasionally
+                if random.random() < 0.5:  # 50% chance each cycle
+                    if len(rl_agent.states) >= rl_agent.batch_size:
+                        print("Training agent from recent experiences...")
+                        rl_agent.train_from_buffer()
+            
+            # Save model periodically
+            if random.random() < 0.1:  # 10% chance each cycle
+                try:
+                    rl_agent.save("trading_agent_actor_latest.h5", "trading_agent_critic_latest.h5")
+                    print("Agent model saved")
+                except Exception as e:
+                    print(f"Error saving model: {str(e)}")
+            
+            # Print status
+            print(f"Position: {position}, Entry: {entry_price}, Current: {current_price}")
+            print(f"Action probabilities - Sell: {probs[0]:.2f}, Hold: {probs[1]:.2f}, Buy: {probs[2]:.2f}")
+            print(f"Current Equity: ${equity_curve[-1]:.2f}, Max Drawdown: {max_drawdown:.2%}")
+            
+            # Summary of performance
+            if len(trades) > 0:
+                win_rate = sum(1 for t in trades if t['profit'] > 0) / len(trades)
+                avg_profit = sum(t['profit'] for t in trades) / len(trades)
+                print(f"Total Trades: {len(trades)}, Win Rate: {win_rate:.2%}, Avg Profit: {avg_profit:.2%}")
+            
+            # Sleep until next check
+            print(f"Waiting for next cycle...")
+            time.sleep(300)  # 5 minutes between checks
+            
+    except KeyboardInterrupt:
+        print("Trading stopped by user")
+        
+        # Save final model
+        if 'rl_agent' in globals() and rl_agent is not None:
+            rl_agent.save("trading_agent_actor_final.h5", "trading_agent_critic_final.h5")
+            print("Final agent model saved")
+        
+        # Save trade history
+        with open("trade_history.json", "w") as f:
+            json.dump(trades, f)
+        
+        return trades, equity_curve
+    except Exception as e:
+        print(f"Error in live trading: {str(e)}")
+        traceback.print_exc()
+        
+        # Try to save model
+        if 'rl_agent' in globals() and rl_agent is not None:
+            rl_agent.save("trading_agent_actor_emergency.h5", "trading_agent_critic_emergency.h5")
+            print("Emergency agent model saved")
+        
+        return None, None
 #==============================================================================
 # MAIN SYSTEM CLASS
 #==============================================================================         
@@ -15759,97 +16654,1376 @@ class NQAlphaEliteSystem:
         
         self.logger.info("Quantum-Enhanced Elite main system thread completed")
                     
+    # --- ONLINE REINFORCEMENT LEARNING FUNCTIONS ---
+
+def create_market_state(df, idx, lookback=10):
+        """Create state representation from market data"""
+        if idx < lookback:
+            return None
+            
+        # Price features
+        close_prices = df['Close'].values[idx-lookback:idx]
+        open_prices = df['Open'].values[idx-lookback:idx]
+        high_prices = df['High'].values[idx-lookback:idx]
+        low_prices = df['Low'].values[idx-lookback:idx]
+        volumes = df['Volume'].values[idx-lookback:idx]
+        
+        # Calculate price changes
+        price_changes = np.diff(close_prices) / close_prices[:-1]
+        
+        # Normalize price data
+        close_mean, close_std = np.mean(close_prices), np.std(close_prices)
+        if close_std == 0:
+            close_std = 1
+        norm_close = (close_prices - close_mean) / close_std
+        
+        # Normalize volumes
+        volume_mean, volume_std = np.mean(volumes), np.std(volumes)
+        if volume_std == 0:
+            volume_std = 1
+        norm_volumes = (volumes - volume_mean) / volume_std
+        
+        # Technical indicators (if available)
+        features = []
+        features.extend(norm_close)
+        features.extend(norm_volumes)
+        
+        # Add RSI if available
+        if 'RSI' in df.columns:
+            rsi_values = df['RSI'].values[idx-lookback:idx]
+            normalized_rsi = (rsi_values - 50) / 25  # Center around 0
+            features.extend(normalized_rsi)
+        
+        # Add MACD if available
+        if 'MACD' in df.columns and 'MACD_Signal' in df.columns:
+            macd_values = df['MACD'].values[idx-lookback:idx]
+            macd_signal = df['MACD_Signal'].values[idx-lookback:idx]
+            macd_hist = macd_values - macd_signal
+            max_macd = max(abs(np.max(macd_hist)), abs(np.min(macd_hist)))
+            if max_macd > 0:
+                normalized_macd = macd_hist / max_macd
+            else:
+                normalized_macd = macd_hist
+            features.extend(normalized_macd)
+        
+        # Add recent price changes
+        features.extend(price_changes)
+        
+        # Add candlestick patterns
+        for i in range(lookback-1):
+            body = (close_prices[i+1] - open_prices[i+1]) / open_prices[i+1]
+            upper_wick = (high_prices[i+1] - max(close_prices[i+1], open_prices[i+1])) / open_prices[i+1]
+            lower_wick = (min(close_prices[i+1], open_prices[i+1]) - low_prices[i+1]) / open_prices[i+1]
+            features.extend([body, upper_wick, lower_wick])
+        
+        return np.array(features).reshape(1, -1)
+
+def calculate_reward(action, position, entry_price, current_price, next_price):
+        """Calculate reward for a trading action"""
+        reward = 0
+        new_position = position
+        new_entry_price = entry_price
+        
+        # Price change percentage
+        price_change_pct = (next_price - current_price) / current_price if current_price > 0 else 0
+        
+        # Action: Sell (0)
+        if action == 0:
+            if position == 1:  # Closing a long position
+                profit_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                # Higher reward for profitable trades
+                reward = profit_pct * 100  # Scale up reward
+                if profit_pct > 0:
+                    reward *= 1.5  # Extra bonus for profitable trades
+                new_position = 0
+                new_entry_price = 0
+            elif position == 0:  # Opening a short position
+                new_position = -1
+                new_entry_price = current_price
+                # Initial reward based on price movement (positive if price goes down)
+                reward = -price_change_pct * 100
+            else:  # Already in short position
+                # Reward for holding correct position
+                reward = -price_change_pct * 100
+        
+        # Action: Hold (1)
+        elif action == 1:
+            if position == 1:  # Long position
+                reward = price_change_pct * 100
+            elif position == -1:  # Short position
+                reward = -price_change_pct * 100
+            else:  # No position
+                # Small penalty for sitting out
+                reward = -abs(price_change_pct) * 10
+        
+        # Action: Buy (2)
+        elif action == 2:
+            if position == -1:  # Closing a short position
+                profit_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0
+                # Higher reward for profitable trades
+                reward = profit_pct * 100  # Scale up reward
+                if profit_pct > 0:
+                    reward *= 1.5  # Extra bonus for profitable trades
+                new_position = 0
+                new_entry_price = 0
+            elif position == 0:  # Opening a long position
+                new_position = 1
+                new_entry_price = current_price
+                # Initial reward based on price movement (positive if price goes up)
+                reward = price_change_pct * 100
+            else:  # Already in long position
+                # Reward for holding correct position
+                reward = price_change_pct * 100
+        
+        # Trading cost penalty
+        if position != new_position:
+            reward -= 2  # Fixed cost for trading
+        
+        return reward, new_position, new_entry_price, price_change_pct
+
+def train_rl_trading_system(df, lookback=10, episodes=100):
+        """Train RL agent on historical market data"""
+        print("Starting RL trading system training...")
+        
+        # Create state representation
+        test_idx = lookback + 5
+        test_state = create_market_state(df, test_idx, lookback)
+        if test_state is None:
+            print("Error: Cannot create state representation")
+            return None
+        
+        # State and action dimensions
+        state_size = test_state.shape[1]
+        action_size = 3  # 0=Sell, 1=Hold, 2=Buy
+        
+        print(f"State size: {state_size}, Action size: {action_size}")
+        
+        # Initialize agent
+        agent = RLTradingAgent(state_size, action_size)
+        
+        # Check for existing trained model
+        model_path = "rl_trading_model.h5"
+        if os.path.exists(model_path):
+            print("Loading existing model...")
+            agent.load_model(model_path)
+        
+        # Training loop
+        best_performance = -float('inf')
+        
+        for episode in range(episodes):
+            print(f"\nEpisode {episode+1}/{episodes}")
+            
+            # Reset for new episode
+            total_profit = 0
+            total_reward = 0
+            position = 0
+            entry_price = 0
+            trade_count = 0
+            
+            # Start from a random point to increase exploration
+            start_idx = random.randint(lookback, int(len(df) * 0.7))
+            end_idx = min(start_idx + 500, len(df) - 1)  # Limit episode length
+            
+            for idx in range(start_idx, end_idx):
+                # Create state representation
+                state = create_market_state(df, idx, lookback)
+                if state is None:
+                    continue
+                
+                # Choose action
+                action = agent.act(state)
+                
+                # Execute action
+                current_price = df['Close'].iloc[idx]
+                next_price = df['Close'].iloc[idx + 1]
+                
+                # Calculate reward
+                reward, position, entry_price, price_change = calculate_reward(
+                    action, position, entry_price, current_price, next_price
+                )
+                
+                # Update total reward
+                total_reward += reward
+                
+                # Calculate profit
+                trade_profit = 0
+                if position == 1:
+                    trade_profit = price_change
+                elif position == -1:
+                    trade_profit = -price_change
+                
+                total_profit += trade_profit
+                
+                # Get next state
+                next_state = create_market_state(df, idx + 1, lookback)
+                if next_state is None:
+                    continue
+                
+                # Remember experience
+                done = (idx == end_idx - 1)
+                agent.remember(state, action, reward, next_state, done)
+                
+                # Log performance
+                if idx % 10 == 0:
+                    agent.log_performance(idx - start_idx, reward, total_profit)
+                
+                # Train network
+                if len(agent.memory) > agent.batch_size:
+                    loss = agent.replay(agent.batch_size)
+                
+                # Count trades for statistics
+                if action != 1:  # Not hold
+                    trade_count += 1
+            
+            # End of episode statistics
+            print(f"Episode {episode+1} results:")
+            print(f"Total reward: {total_reward:.2f}")
+            print(f"Total profit: {total_profit:.2%}")
+            print(f"Number of trades: {trade_count}")
+            
+            # Save if best performance
+            if total_profit > best_performance:
+                best_performance = total_profit
+                agent.save_model(model_path)
+                print(f"New best model saved with profit: {total_profit:.2%}")
+        
+        print("RL training completed")
+        return agent
+
+def implement_rl_strategy(df, agent, lookback=10):
+        """Implement RL strategy on market data"""
+        print("Implementing RL trading strategy...")
+        
+        if agent is None:
+            print("Error: No RL agent provided")
+            return df
+        
+        # Initialize trading variables
+        position = 0
+        entry_price = 0
+        signals = []
+        profits = []
+        
+        for idx in range(lookback, len(df) - 1):
+            # Create state representation
+            state = create_market_state(df, idx, lookback)
+            if state is None:
+                signals.append(0)
+                profits.append(0)
+                continue
+            
+            # Choose action (no exploration in implementation)
+            action = agent.act(state, training=False)
+            
+            # Current price
+            current_price = df['Close'].iloc[idx]
+            
+            # Execute action
+            if action == 0:  # Sell
+                if position == 1:  # Close long
+                    position = 0
+                    profit = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                    profits.append(profit)
+                    signals.append(-1)  # Sell signal
+                elif position == 0:  # Go short
+                    position = -1
+                    entry_price = current_price
+                    profits.append(0)
+                    signals.append(-1)  # Sell signal
+                else:  # Already short
+                    profits.append(0)
+                    signals.append(0)  # No new signal
+            
+            elif action == 1:  # Hold
+                profits.append(0)
+                signals.append(0)  # Hold signal
+            
+            elif action == 2:  # Buy
+                if position == -1:  # Close short
+                    position = 0
+                    profit = (entry_price - current_price) / entry_price if entry_price > 0 else 0
+                    profits.append(profit)
+                    signals.append(1)  # Buy signal
+                elif position == 0:  # Go long
+                    position = 1
+                    entry_price = current_price
+                    profits.append(0)
+                    signals.append(1)  # Buy signal
+                else:  # Already long
+                    profits.append(0)
+                    signals.append(0)  # No new signal
+        
+        # Add signals to dataframe
+        df['RL_Signal'] = [0] * lookback + signals + [0]  # Add padding at end if needed
+        
+        # Trim if too long
+        if len(df['RL_Signal']) > len(df):
+            df['RL_Signal'] = df['RL_Signal'][:len(df)]
+        
+        # Compute performance metrics
+        print("\nRL Strategy Performance:")
+        total_profit = sum(profits)
+        win_rate = sum(1 for p in profits if p > 0) / len(profits) if profits else 0
+        
+        print(f"Total profit: {total_profit:.2%}")
+        print(f"Win rate: {win_rate:.2%}")
+        print(f"Number of trades: {len([p for p in profits if p != 0])}")
+        
+        # Add combined signal if original signals exist
+        if 'Signal' in df.columns:
+            # Smart combination: Use RL for strong signals, original otherwise
+            df['Combined_Signal'] = np.where(
+                df['RL_Signal'] != 0,  # When RL has a signal
+                df['RL_Signal'],       # Use RL
+                df['Signal']           # Otherwise use original
+            )
+            
+            # Consensus signal (only trade when both agree)
+            df['Consensus_Signal'] = np.where(
+                (df['RL_Signal'] == df['Signal']) & (df['RL_Signal'] != 0),
+                df['RL_Signal'],
+                0  # Hold if disagreement
+            )
+        
+        return df
+
+def evaluate_rl_performance(df, signal_column='RL_Signal', initial_capital=10000):
+        """Evaluate trading performance of RL signals"""
+        # Copy dataframe to avoid modifying original
+        eval_df = df.copy()
+        
+        # Ensure the signal column exists
+        if signal_column not in eval_df.columns:
+            print(f"Error: {signal_column} column not found")
+            return None
+        
+        # Initialize variables
+        capital = initial_capital
+        position = 0
+        entry_price = 0
+        trades = []
+        equity_curve = [initial_capital]
+        
+        # Simulate trading
+        for i in range(1, len(eval_df)):
+            signal = eval_df[signal_column].iloc[i-1]  # Previous signal determines current position
+            current_price = eval_df['Close'].iloc[i]
+            
+            # Process signal
+            if signal == 1 and position <= 0:  # Buy signal
+                # Close any existing short position
+                if position < 0:
+                    profit = entry_price - current_price
+                    capital += profit * abs(position)
+                    trades.append({
+                        'type': 'close_short',
+                        'entry': entry_price,
+                        'exit': current_price,
+                        'profit': (entry_price - current_price) / entry_price,
+                        'capital': capital
+                    })
+                
+                # Open long position
+                position = 1
+                entry_price = current_price
+                
+            elif signal == -1 and position >= 0:  # Sell signal
+                # Close any existing long position
+                if position > 0:
+                    profit = current_price - entry_price
+                    capital += profit * position
+                    trades.append({
+                        'type': 'close_long',
+                        'entry': entry_price,
+                        'exit': current_price,
+                        'profit': (current_price - entry_price) / entry_price,
+                        'capital': capital
+                    })
+                
+                # Open short position
+                position = -1
+                entry_price = current_price
+            
+            # Update equity curve
+            if position == 1:
+                equity_curve.append(capital + (current_price - entry_price) * position)
+            elif position == -1:
+                equity_curve.append(capital + (entry_price - current_price) * abs(position))
+            else:
+                equity_curve.append(capital)
+        
+        # Close final position for accurate P&L
+        final_price = eval_df['Close'].iloc[-1]
+        if position == 1:
+            profit = final_price - entry_price
+            capital += profit * position
+            trades.append({
+                'type': 'close_final_long',
+                'entry': entry_price,
+                'exit': final_price,
+                'profit': (final_price - entry_price) / entry_price,
+                'capital': capital
+            })
+        elif position == -1:
+            profit = entry_price - final_price
+            capital += profit * abs(position)
+            trades.append({
+                'type': 'close_final_short',
+                'entry': entry_price,
+                'exit': final_price,
+                'profit': (entry_price - final_price) / entry_price,
+                'capital': capital
+            })
+        
+        # Calculate metrics
+        total_return = (capital / initial_capital) - 1
+        
+        # Calculate drawdown
+        equity_curve = np.array(equity_curve)
+        running_max = np.maximum.accumulate(equity_curve)
+        drawdown = (equity_curve / running_max) - 1
+        max_drawdown = drawdown.min()
+        
+        # Calculate Sharpe ratio
+        if len(trades) > 1:
+            returns = [(t['capital'] / prev_t['capital']) - 1 for t, prev_t in zip(trades[1:], trades[:-1])]
+            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+        else:
+            sharpe_ratio = 0
+        
+        # Print performance summary
+        print(f"\nPerformance of {signal_column}:")
+        print(f"Total Return: {total_return:.2%}")
+        print(f"Number of Trades: {len(trades)}")
+        if len(trades) > 0:
+            print(f"Win Rate: {sum(1 for t in trades if t.get('profit', 0) > 0) / len(trades):.2%}")
+        print(f"Max Drawdown: {max_drawdown:.2%}")
+        print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+        
+        return {
+            'total_return': total_return,
+            'trades': trades,
+            'equity_curve': equity_curve,
+            'max_drawdown': max_drawdown,
+            'sharpe_ratio': sharpe_ratio
+        }
+
+def calculate_reward(action, position, entry_price, current_price, next_price, trade_count=0, max_drawdown=0):
+        """Calculate a sophisticated reward signal aligned with trading goals"""
+        # Initialize
+        reward = 0
+        new_position = position
+        new_entry_price = entry_price
+        
+        # Price change
+        price_change_pct = (next_price - current_price) / current_price if current_price != 0 else 0
+        
+        # Action: Sell (0)
+        if action == 0:
+            if position == 1:  # Close long
+                profit_pct = (current_price - entry_price) / entry_price if entry_price != 0 else 0
+                # Higher reward for profitable trades
+                if profit_pct > 0:
+                    reward = profit_pct * 100  # Scale reward
+                else:
+                    reward = profit_pct * 50   # Lower penalty for losses
+                new_position = 0
+                new_entry_price = 0
+            elif position == 0:  # Go short
+                new_position = -1
+                new_entry_price = current_price
+                # Initial reward based on next period's move
+                reward = -price_change_pct * 80
+            else:  # Already short
+                # Reward for correct position
+                reward = -price_change_pct * 80
+        
+        # Action: Hold (1)
+        elif action == 1:
+            if position == 1:  # Long position
+                reward = price_change_pct * 80
+            elif position == -1:  # Short position
+                reward = -price_change_pct * 80
+            else:  # No position
+                # Small penalty for sitting out, but less than trading cost
+                reward = -abs(price_change_pct) * 5
+        
+        # Action: Buy (2)
+        elif action == 2:
+            if position == -1:  # Close short
+                profit_pct = (entry_price - current_price) / entry_price if entry_price != 0 else 0
+                # Higher reward for profitable trades
+                if profit_pct > 0:
+                    reward = profit_pct * 100
+                else:
+                    reward = profit_pct * 50
+                new_position = 0
+                new_entry_price = 0
+            elif position == 0:  # Go long
+                new_position = 1
+                new_entry_price = current_price
+                # Initial reward based on next period's move
+                reward = price_change_pct * 80
+            else:  # Already long
+                # Reward for correct position
+                reward = price_change_pct * 80
+        
+        # Trading cost penalty
+        if position != new_position:
+            reward -= 2  # Fixed cost for trading
+            
+            # Additional penalty for excessive trading
+            if trade_count > 10:  # If more than 10 trades in recent window
+                reward -= (trade_count - 10) * 0.2  # Increasing penalty
+        
+        # Risk-adjusted reward modifications
+        if max_drawdown < -0.05:  # If drawdown is worse than 5%
+            # Reduce reward to encourage more conservative behavior
+            reward *= (1 + max_drawdown * 2)  # E.g., 10% drawdown = 80% of normal reward
+        
+        # Reward shaping for trend following
+        if (position == 1 and price_change_pct > 0) or (position == -1 and price_change_pct < 0):
+            # Bonus for riding the trend
+            reward *= 1.2
+        
+        return reward, new_position, new_entry_price
+
+def train_online_rl(agent, state, action, reward, next_state, done, trade_count=0, max_drawdown=0):
+        """Train RL agent online with the latest experience"""
+        # Store experience
+        agent.remember(state, action, reward, next_state, done)
+        
+        # Train if enough experiences are collected
+        if len(agent.states) >= agent.batch_size:
+            agent.train_from_buffer()
+        
+        # Periodically train from replay buffer for offline learning
+        if random.random() < 0.05:  # 5% chance each step
+            agent.train_offline_batch()
+        
+        # If episode ended (e.g., end of day or week)
+        if done:
+            # Always train at episode end
+            if len(agent.states) > 0:
+                agent.train_from_buffer()
+            
+            # Track rewards for this episode
+            agent.total_rewards.append(reward)
+            
+            # Save model periodically
+            if len(agent.total_rewards) % 10 == 0:
+                try:
+                    agent.save(
+                        f"trading_agent_actor_{len(agent.total_rewards)}.h5",
+                        f"trading_agent_critic_{len(agent.total_rewards)}.h5"
+                    )
+                    print(f"Model saved after {len(agent.total_rewards)} episodes")
+                except Exception as e:
+                    print(f"Error saving model: {str(e)}")
+
+def implement_rl_trading_strategy(bot, kline_data):
+        """Implement RL trading strategy with online learning"""
+        print("Initializing Online RL Trading Strategy...")
+        
+        # Ensure we have technical indicators
+        if 'RSI' not in kline_data.columns:
+            kline_data['RSI'] = talib.RSI(kline_data['Close'], timeperiod=14)
+        
+        if 'MACD' not in kline_data.columns or 'MACD_Signal' not in kline_data.columns:
+            macd, macd_signal, _ = talib.MACD(kline_data['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+            kline_data['MACD'] = macd
+            kline_data['MACD_Signal'] = macd_signal
+        
+        # Create state and action dimensions
+        lookback = 20
+        test_state = create_market_state(kline_data, lookback+5, lookback)
+        if test_state is None:
+            print("Error: Cannot create state representation")
+            return bot, kline_data
+        
+        state_size = test_state.shape[0]
+        action_size = 3  # 0=Sell, 1=Hold, 2=Buy
+        
+        print(f"State size: {state_size}, Action size: {action_size}")
+        
+        # Initialize or load agent
+        agent_path = "trading_agent_actor_latest.h5"
+        if os.path.exists(agent_path):
+            print("Loading existing RL agent...")
+            agent = OnlinePPOAgent(state_size, action_size)
+            agent.load("trading_agent_actor_latest.h5", "trading_agent_critic_latest.h5")
+        else:
+            print("Creating new RL agent...")
+            agent = OnlinePPOAgent(state_size, action_size)
+        
+        # Initialize trading variables
+        position = 0
+        entry_price = 0
+        signals = []
+        rewards = []
+        trade_count = 0
+        max_drawdown = 0
+        equity_curve = [1000]  # Starting with $1000
+        
+        # Track performance
+        print("Beginning RL trading simulation...")
+        
+        # Simulate trading with online learning
+        for idx in range(lookback, len(kline_data)):
+            # Create state representation
+            state = create_market_state(kline_data, idx, lookback)
+            if state is None:
+                signals.append(0)
+                continue
+            
+            # Get action (with exploration during training)
+            action, log_prob, value, _ = agent.get_action(state)
+            
+            # Execute action
+            current_price = kline_data['Close'].iloc[idx]
+            
+            # For next state and reward calculation
+            next_idx = min(idx + 1, len(kline_data) - 1)
+            next_price = kline_data['Close'].iloc[next_idx]
+            
+            # Calculate reward
+            reward, position, entry_price = calculate_reward(
+                action, position, entry_price, current_price, next_price, 
+                trade_count, max_drawdown
+            )
+            
+            # Store reward
+            rewards.append(reward)
+            
+            # Create next state
+            next_state = create_market_state(kline_data, next_idx, lookback) if next_idx < len(kline_data) else state
+            
+            # Episode ends at end of data
+            done = (next_idx == len(kline_data) - 1)
+            
+            # Online learning
+            train_online_rl(agent, state, action, reward, next_state, done, trade_count, max_drawdown)
+            
+            # Track position changes for trade count
+            if position != 0:
+                trade_count += 1
+            else:
+                trade_count = max(0, trade_count - 1)  # Decay trade count
+            
+            # Update equity curve
+            if position == 1:
+                pnl = (next_price - current_price) / current_price
+            elif position == -1:
+                pnl = (current_price - next_price) / current_price
+            else:
+                pnl = 0
+                
+            equity_curve.append(equity_curve[-1] * (1 + pnl))
+            
+            # Calculate drawdown
+            peak = max(equity_curve)
+            current_dd = (equity_curve[-1] / peak) - 1
+            max_drawdown = min(max_drawdown, current_dd)
+            
+            # Convert action to signal
+            if action == 0:  # Sell
+                signals.append(-1)
+            elif action == 1:  # Hold
+                signals.append(0)
+            else:  # Buy
+                signals.append(1)
+        
+        # Save final model
+        agent.save("trading_agent_actor_latest.h5", "trading_agent_critic_latest.h5")
+        
+        # Add signals to dataframe
+        kline_data['RL_Signal'] = [0] * lookback + signals
+        
+        # If original signals exist, create combined signals
+        if 'Signal' in kline_data.columns:
+            # Strategy 1: Use RL when confident, otherwise use original
+            kline_data['Combined_Signal'] = np.where(
+                kline_data['RL_Signal'] != 0,  # When RL has a strong opinion
+                kline_data['RL_Signal'],       # Use RL signal
+                kline_data['Signal']           # Otherwise use original
+            )
+            
+            # Strategy 2: Combine signals (only trade when both agree)
+            kline_data['Consensus_Signal'] = np.where(
+                (kline_data['RL_Signal'] == kline_data['Signal']) & (kline_data['RL_Signal'] != 0),
+                kline_data['RL_Signal'],
+                0  # Hold if disagreement
+            )
+        else:
+            kline_data['Combined_Signal'] = kline_data['RL_Signal']
+            kline_data['Consensus_Signal'] = kline_data['RL_Signal']
+        
+        # Calculate performance metrics for RL strategy
+        print("\nRL Strategy Performance:")
+        rl_returns = []
+        position = 0
+        
+        for i in range(1, len(kline_data)):
+            signal = kline_data['RL_Signal'].iloc[i-1]
+            if signal == 1:
+                position = 1
+            elif signal == -1:
+                position = -1
+            
+            if position == 1:
+                rl_returns.append((kline_data['Close'].iloc[i] / kline_data['Close'].iloc[i-1]) - 1)
+            elif position == -1:
+                rl_returns.append((kline_data['Close'].iloc[i-1] / kline_data['Close'].iloc[i]) - 1)
+            else:
+                rl_returns.append(0)
+        
+        # Calculate metrics
+        rl_returns = np.array(rl_returns)
+        total_return = np.prod(1 + rl_returns) - 1
+        annual_return = ((1 + total_return) ** (252 / len(rl_returns))) - 1
+        sharpe = np.mean(rl_returns) / np.std(rl_returns) * np.sqrt(252) if np.std(rl_returns) > 0 else 0
+        max_dd = calculate_max_drawdown(np.cumprod(1 + rl_returns))
+        
+        print(f"Total Return: {total_return:.2%}")
+        print(f"Annual Return: {annual_return:.2%}")
+        print(f"Sharpe Ratio: {sharpe:.2f}")
+        print(f"Max Drawdown: {max_dd:.2%}")
+        
+        # Update bot with RL capability
+        bot.rl_agent = agent
+        
+        return bot, kline_data
+def integrate_rl_with_existing_strategy(market_data):
+    """Integrate RL with existing trading strategy"""
+    print("Integrating RL agent with existing strategy...")
+    
+    # Ensure required columns exist
+    df_rl = market_data.copy()
+    
+    # Add technical indicators if not already present
+    if 'RSI' not in df_rl.columns:
+        df_rl['RSI'] = talib.RSI(df_rl['Close'], timeperiod=14)
+    
+    if 'MACD' not in df_rl.columns or 'MACD_Signal' not in df_rl.columns:
+        macd, macd_signal, _ = talib.MACD(df_rl['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        df_rl['MACD'] = macd
+        df_rl['MACD_Signal'] = macd_signal
+    
+    # Split data for training and testing
+    train_size = int(len(df_rl) * 0.8)
+    df_train = df_rl.iloc[:train_size].copy()
+    df_test = df_rl.iloc[train_size:].copy()
+    
+    print(f"Training data size: {len(df_train)}, Testing data size: {len(df_test)}")
+    
+    # Train the RL agent
+    agent = train_rl_agent(df_train, episodes=50, lookback=10)
+    
+    if agent is not None:
+        # Generate signals for the entire dataset
+        signals = rl_trading_strategy(df_rl, agent)
+        
+        # Pad signals to match df length
+        padded_signals = [0] * 10 + signals  # 10 is the lookback period
+        if len(padded_signals) > len(market_data):
+            padded_signals = padded_signals[:len(market_data)]
+        elif len(padded_signals) < len(market_data):
+            padded_signals.extend([0] * (len(market_data) - len(padded_signals)))
+            
+        # Add RL signals to original dataframe
+        market_data['RL_Signal'] = padded_signals
+        
+        # Combine RL signals with existing signals if available
+        if 'Signal' in market_data.columns:
+            market_data['Combined_Signal'] = np.where(
+                market_data['RL_Signal'] != 0,  # If RL has a signal
+                market_data['RL_Signal'],       # Use RL signal
+                market_data['Signal']           # Otherwise use existing signal
+            )
+            print("Combined RL signals with existing signals")
+        else:
+            market_data['Combined_Signal'] = market_data['RL_Signal']
+            print("Using only RL signals (no existing signals found)")
+        
+        return market_data, agent
+    else:
+        print("RL agent training failed, using original dataframe")
+        return market_data, None
+def train_rl_agent(df, episodes=100, batch_size=32, lookback=10):
+        """Train the RL agent on historical data"""
+        print("Starting RL agent training...")
+        
+        # Make sure we have all necessary columns
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in df.columns for col in required_cols):
+            print("Error: Required columns missing from DataFrame")
+            missing = [col for col in required_cols if col not in df.columns]
+            print(f"Missing columns: {missing}")
+            return None
+            
+        # Make sure we have enough data
+        if len(df) <= lookback + 10:
+            print(f"Error: Not enough data points. Need more than {lookback + 10}, got {len(df)}")
+            return None
+        
+        # Calculate state size based on our state representation
+        test_idx = min(len(df)-1, lookback + 10)  # Safe index
+        test_state = create_market_state(df, test_idx, lookback)
+        if test_state is None:
+            print("Cannot create valid state representation")
+            return None
+        
+        state_size = len(test_state)
+        action_size = 3  # Sell, Hold, Buy
+        
+        print(f"State size: {state_size}, Action size: {action_size}")
+        
+        # Initialize agent
+        agent = RLTradingAgent(state_size, action_size)
+        
+        # Training loop
+        for episode in range(episodes):
+            # Reset environment
+            position = 0  # No position
+            entry_price = 0
+            total_reward = 0
+            
+            # Start from a random point after lookback periods
+            start_idx = random.randint(lookback, int(len(df)*0.7))  # Use 70% of data for training
+            
+            # Loop through the episode
+            for current_idx in range(start_idx, len(df)-1):
+                # Get current state
+                state = create_market_state(df, current_idx, lookback)
+                if state is None:
+                    continue
+                    
+                # Get action
+                action = agent.act(state)
+                
+                # Calculate reward and update position
+                current_price = df['Close'].iloc[current_idx]
+                next_price = df['Close'].iloc[current_idx+1]
+                
+                reward, position, entry_price, _ = calculate_reward(
+                    action, position, entry_price, current_price, next_price
+                )
+                
+                # Get next state
+                next_state = create_market_state(df, current_idx+1, lookback)
+                if next_state is None:
+                    continue
+                
+                # Done flag (episode ends at the last data point)
+                done = (current_idx == len(df)-2)
+                
+                # Store in memory
+                agent.remember(state, action, reward, next_state, done)
+                
+                total_reward += reward
+                
+                # Train model if we have enough samples
+                if len(agent.memory) > batch_size:
+                    agent.replay(batch_size)
+                    
+            # Episode summary    
+            print(f"Episode: {episode+1}/{episodes}, Total Reward: {total_reward:.2f}")
+                    
+            # Save the model periodically
+            if (episode + 1) % 10 == 0:
+                try:
+                    agent.save_model(f"rl_trading_ep{episode+1}.h5")
+                    print(f"Model saved at episode {episode+1}")
+                except Exception as e:
+                    print(f"Error saving model: {e}")
+                
+        # Final save
+        try:
+            agent.save_model("rl_trading_final.h5")
+            print("Final model saved")
+        except Exception as e:
+            print(f"Error saving final model: {e}")
+            
+        return agent
+
+def rl_trading_strategy(df, agent, lookback=10):
+        """Use the trained RL agent to make trading decisions"""
+        signals = []
+        position = 0
+        entry_price = 0
+        
+        for idx in range(lookback, len(df)):
+            state = create_market_state(df, idx, lookback)
+            if state is None:
+                signals.append(0)  # Hold if we can't create a state
+                continue
+                
+            # Get action from agent
+            action = agent.act(state)
+            
+            # Update position based on action
+            current_price = df['Close'].iloc[idx]
+            
+            if action == 0:  # Sell
+                if position == 1:  # Close long
+                    position = 0
+                    signals.append(-1)  # Sell signal
+                elif position == 0:  # Go short
+                    position = -1
+                    entry_price = current_price
+                    signals.append(-1)  # Sell signal
+                else:  # Already short
+                    signals.append(0)  # Hold signal
+            
+            elif action == 1:  # Hold
+                signals.append(0)  # Hold signal
+            
+            elif action == 2:  # Buy
+                if position == -1:  # Close short
+                    position = 0
+                    signals.append(1)  # Buy signal
+                elif position == 0:  # Go long
+                    position = 1
+                    entry_price = current_price
+                    signals.append(1)  # Buy signal
+                else:  # Already long
+                    signals.append(0)  # Hold signal
+                    
+        return signals
+
+def evaluate_rl_performance(df, agent, lookback=10):
+        """Evaluate the RL agent's performance on test data"""
+        signals = rl_trading_strategy(df, agent, lookback)
+        
+        # Ensure signals are the right length (account for lookback period)
+        padded_signals = [0] * lookback + signals
+        
+        # Trim to match df length
+        if len(padded_signals) > len(df):
+            padded_signals = padded_signals[:len(df)]
+        
+        # Add signals to dataframe
+        df_eval = df.copy()
+        df_eval['RL_Signal'] = padded_signals
+        
+        # Calculate returns
+        df_eval['Position'] = df_eval['RL_Signal'].shift(1).fillna(0)
+        df_eval['Strategy_Return'] = df_eval['Position'] * df_eval['Close'].pct_change()
+        
+        # Calculate metrics
+        total_return = (df_eval['Strategy_Return'] + 1).cumprod().iloc[-1] - 1
+        annual_return = ((1 + total_return) ** (252 / len(df_eval)) - 1)
+        daily_returns = df_eval['Strategy_Return'].dropna()
+        sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * (252 ** 0.5) if daily_returns.std() != 0 else 0
+        
+        # Calculate drawdown
+        cumulative_returns = (1 + df_eval['Strategy_Return'].fillna(0)).cumprod()
+        running_max = cumulative_returns.cummax()
+        drawdown = (cumulative_returns / running_max) - 1
+        max_drawdown = drawdown.min()
+        
+        print(f"--- RL PERFORMANCE METRICS ---")
+        print(f"Total Return: {total_return:.2%}")
+        print(f"Annual Return: {annual_return:.2%}")
+        print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+        print(f"Max Drawdown: {max_drawdown:.2%}")
+        
+        return {
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown
+        }        
+def calculate_max_drawdown(equity_curve):
+        """Calculate maximum drawdown from equity curve"""
+        max_dd = 0
+        peak = equity_curve[0]
+        
+        for value in equity_curve:
+            if value > peak:
+                peak = value
+            dd = (value / peak) - 1
+            max_dd = min(max_dd, dd)
+        
+        return max_dd
+def setup_exchange(exchange_id='binance', test_mode=True):
+    """
+    Set up and configure the exchange connection.
+    
+    Parameters:
+    -----------
+    exchange_id : str
+        The exchange to connect to (default: 'binance')
+    test_mode : bool
+        Whether to use testnet/paper trading (default: True)
+        
+    Returns:
+    --------
+    exchange : object
+        Configured exchange object
+    """
+    import ccxt
+    import os
+    from dotenv import load_dotenv
+    
+    # Load API keys from .env file (more secure than hardcoding)
+    load_dotenv()
+    
+    print(f"Setting up connection to {exchange_id.upper()}...")
+    
+    try:
+        # Check if the exchange is supported
+        if exchange_id.lower() not in ccxt.exchanges:
+            print(f"Exchange {exchange_id} not supported by CCXT. Supported exchanges:")
+            print(', '.join(ccxt.exchanges))
+            print("Defaulting to Binance...")
+            exchange_id = 'binance'
+        
+        # Initialize the exchange
+        exchange_class = getattr(ccxt, exchange_id.lower())
+        
+        # Configuration dictionary
+        config = {
+            'enableRateLimit': True,  # Prevent ban due to rate limit
+            'options': {
+                'defaultType': 'future',  # Use futures by default (for NQ trading)
+                'adjustForTimeDifference': True,
+            }
+        }
+        
+        # Add API credentials if available
+        api_key = os.getenv(f'{exchange_id.upper()}_API_KEY')
+        api_secret = os.getenv(f'{exchange_id.upper()}_API_SECRET')
+        
+        if api_key and api_secret:
+            config['apiKey'] = api_key
+            config['secret'] = api_secret
+            print("API credentials loaded successfully")
+        else:
+            print("Warning: No API credentials found. Running in read-only mode.")
+        
+        # Set up testnet if in test mode
+        if test_mode:
+            if exchange_id.lower() == 'binance':
+                config['options']['defaultType'] = 'future'
+                config['urls'] = {
+                    'api': {
+                        'public': 'https://testnet.binancefuture.com/fapi/v1',
+                        'private': 'https://testnet.binancefuture.com/fapi/v1',
+                    }
+                }
+            print(f"Test mode enabled: Connected to {exchange_id.upper()} testnet")
+        
+        # Create exchange instance
+        exchange = exchange_class(config)
+        
+        # Load markets (symbols, trading pairs, etc.)
+        exchange.load_markets()
+        print(f"Successfully connected to {exchange_id.upper()}")
+        
+        # Test connection by fetching ticker
+        exchange.fetch_ticker('NQ/USD')
+        print("Exchange connection verified")
+        
+        return exchange
+        
+    except ccxt.BaseError as e:
+        print(f"Error connecting to {exchange_id}: {str(e)}")
+        print("Falling back to simulation mode...")
+        
+        # Create a simulated exchange for paper trading
+        from trading_simulator import SimulatedExchange  # You'll need to implement this
+        return SimulatedExchange()
+        
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        print("Falling back to simulation mode...")
+        
+        #
 
 
 def main():
-    """Main entry point"""
-    # Configure root logger first
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("logs/nq_alpha_elite.log"),
-            logging.StreamHandler()
-        ]
-    )
-    logger = logging.getLogger("NQAlpha")
-    
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="NQ Alpha Elite - World's Best Trading Bot")
-    parser.add_argument("--mode", choices=["paper", "live", "backtest"], default="paper", help="Trading mode")
-    parser.add_argument("--capital", type=float, default=100000.0, help="Initial capital")
-    parser.add_argument("--config", type=str, help="Path to configuration file")
-    parser.add_argument("--enable_rl", action="store_true", help="Enable reinforcement learning")
-    args = parser.parse_args()
-    
-    # Print banner
-    banner = """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║                       NQ ALPHA ELITE TRADING SYSTEM                          ║
-║                                                                              ║
-║                       World's Best Trading Bot                               ║
-║                                                                              ║
-║  Current User: {user}                                                        ║
-║  Current Time: {time}                                                        ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-    """.format(
-        user=os.environ.get('USER', os.environ.get('USERNAME', 'An0nym0usn3thunt3r')),
-        time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
-    
-    print(banner)
-    
+    """
+    Main function for NQ Alpha Elite Trading Bot with Advanced RL Integration
+    World's most sophisticated trading system combining traditional technical analysis
+    with cutting-edge reinforcement learning
+    """
     try:
-        # Create temporary config if --enable_rl is specified
-        if args.enable_rl and not args.config:
-            temp_config = os.path.join('config', 'temp_config.json')
-            with open(temp_config, 'w') as f:
-                json.dump({'use_reinforcement_learning': True}, f)
-            logger.info(f"Created temporary config with RL enabled at {temp_config}")
-            config_path = temp_config
-        else:
-            config_path = args.config
+        print("\n" + "="*60)
+        print("  NQ ALPHA ELITE TRADING SYSTEM - v2.0 'Neural Quantum'")
+        print("  AI-Powered Advanced Trading Platform")
+        print("  Developed by: An0nym0usn3thunt3r")
+        print("="*60)
         
-        # Create and start trading system
-        system = NQAlphaEliteSystem(
-            mode=args.mode,
-            capital=args.capital,
-            config_file=config_path
+        # Display current time
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\nSystem Start: {current_time} UTC")
+        
+        # Set up logging
+        log_dir = "trading_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"trading_log_{current_time.replace(':', '-').replace(' ', '_')}.txt")
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
         )
+        logging.info("Trading system initialized")
         
-        # Start system
-        success = system.start()
+        # Get trading parameters
+        print("\nSetting up trading parameters...")
+        symbol = input("Enter trading symbol (default: NQ): ") or "NQ"
+        timeframe = input("Enter timeframe (default: 1h): ") or "1h"
         
-        if success:
-            logger.info("System started successfully. Press Ctrl+C to stop.")
+        logging.info(f"Trading parameters: Symbol={symbol}, Timeframe={timeframe}")
+        
+        # Fetch market data using web scraper
+        print(f"\nFetching market data for {symbol} on {timeframe} timeframe...")
+        try:
+            # Use your existing web scraper function
+            market_data = fetch_historical_klines(symbol, timeframe)
+            print(f"Successfully fetched {len(market_data)} data points")
+            logging.info(f"Market data fetched: {len(market_data)} candles")
+        except Exception as e:
+            print(f"Error fetching market data: {str(e)}")
+            logging.error(f"Data fetch error: {str(e)}")
+            return None
+        
+        # Process market data
+        print("\nProcessing market data...")
+        market_data = process_klines(market_data)  # Your existing processing function
+        
+        # Add technical indicators
+        print("Adding technical indicators...")
+        market_data = add_indicators(market_data)  # Your existing indicators function
+        
+        # Generate trading signals using traditional strategy
+        print("\nGenerating trading signals using traditional strategy...")
+        signals = generate_signals(market_data)  # Your existing signal generator
+        market_data['Signal'] = signals
+        
+        # Calculate traditional strategy performance
+        print("\nTraditional Strategy Performance:")
+        trad_performance = calculate_performance(market_data, 'Signal')  # Your existing performance calculator
+        
+        # Option to add reinforcement learning
+        use_rl = input("\nIntegrate reinforcement learning? (y/n): ").lower() == 'y'
+        
+        if use_rl:
+            print("\n" + "="*60)
+            print("  NEURAL REINFORCEMENT LEARNING INTEGRATION")
+            print("="*60)
             
-            # Keep main thread alive
-            try:
-                while system.running and not system.shutdown_requested:
-                    time.sleep(1.0)
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received, initiating shutdown")
-                system.shutdown_requested = True
+            # Ask for RL training preference
+            train_new = input("Train new RL model or use existing? (train/use): ").lower() == 'train'
             
-            # Stop system
-            system.stop()
-            logger.info("System shutdown complete")
+            if train_new:
+                print("\nTraining new reinforcement learning model...")
+                # Set training parameters
+                episodes = int(input("Enter number of training episodes (default: 50): ") or "50")
+                logging.info(f"Training new RL model with {episodes} episodes")
+                
+                # Integrate RL with traditional strategy
+                market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, episodes=episodes)
+            else:
+                print("\nLoading existing reinforcement learning model...")
+                logging.info("Using existing RL model")
+                market_data, rl_agent = integrate_rl_with_existing_strategy(market_data, mode='use')
+            
+            # Performance comparison if RL was successfully integrated
+            if 'RL_Signal' in market_data.columns:
+                print("\nRL Strategy Performance:")
+                rl_performance = calculate_performance(market_data, 'RL_Signal')
+                
+                if 'Combined_Signal' in market_data.columns:
+                    print("\nCombined Strategy Performance:")
+                    combined_performance = calculate_performance(market_data, 'Combined_Signal')
         else:
-            logger.error("Failed to start system")
-            return 1
+            print("\nUsing traditional strategy only (no RL integration)")
+            logging.info("RL integration skipped")
         
-        return 0
+        # Strategy selection for backtesting/trading
+        print("\n" + "="*60)
+        print("  STRATEGY SELECTION")
+        print("="*60)
+        
+        if use_rl and 'RL_Signal' in market_data.columns:
+            strategy_options = [
+                "1: Traditional (Technical Indicators)",
+                "2: Reinforcement Learning",
+                "3: Combined (Hybrid Strategy)"
+            ]
+            print("\nAvailable strategies:")
+            for option in strategy_options:
+                print(f"  {option}")
+            
+            strategy_choice = input("\nSelect strategy number (default: 3): ") or "3"
+            
+            if strategy_choice == "1":
+                active_signal = 'Signal'
+                strategy_name = "Traditional"
+            elif strategy_choice == "2":
+                active_signal = 'RL_Signal'
+                strategy_name = "Reinforcement Learning"
+            else:
+                active_signal = 'Combined_Signal'
+                strategy_name = "Combined Hybrid"
+        else:
+            active_signal = 'Signal'
+            strategy_name = "Traditional"
+        
+        print(f"\nSelected strategy: {strategy_name}")
+        logging.info(f"Strategy selected: {strategy_name}")
+        
+        # Trading mode selection
+        print("\n" + "="*60)
+        print("  EXECUTION MODE")
+        print("="*60)
+        
+        print("\nExecution modes:")
+        print("  1: Backtesting (Historical Analysis)")
+        print("  2: Paper Trading (Simulated Live Trading)")
+        print("  3: Live Trading (Real Market Orders)")
+        
+        mode = input("\nSelect execution mode (default: 1): ") or "1"
+        
+        if mode == "1":
+            # Backtesting mode
+            print("\n" + "="*60)
+            print("  BACKTESTING MODE")
+            print("="*60)
+            
+            print(f"\nRunning backtest with {strategy_name} strategy...")
+            logging.info(f"Backtesting {strategy_name} strategy")
+            
+            # Run backtest using your existing backtest function
+            backtest_results = backtest_strategy(market_data, active_signal)
+            
+            # Plot backtest results
+            print("\nGenerating performance charts...")
+            plot_backtest_results(market_data, backtest_results, active_signal)
+            
+            # Save backtest results
+            results_dir = "backtest_results"
+            os.makedirs(results_dir, exist_ok=True)
+            results_file = os.path.join(results_dir, f"backtest_{symbol}_{timeframe}_{strategy_name.replace(' ', '_')}_{current_time.replace(':', '-').replace(' ', '_')}.pkl")
+            
+            try:
+                with open(results_file, 'wb') as f:
+                    pickle.dump(backtest_results, f)
+                print(f"\nBacktest results saved to: {results_file}")
+                logging.info(f"Backtest results saved to: {results_file}")
+            except Exception as e:
+                print(f"Error saving backtest results: {str(e)}")
+                logging.error(f"Error saving backtest results: {str(e)}")
+            
+        elif mode == "2":
+            # Paper trading mode
+            print("\n" + "="*60)
+            print("  PAPER TRADING MODE")
+            print("="*60)
+            
+            print(f"\nStarting paper trading with {strategy_name} strategy...")
+            logging.info(f"Paper trading with {strategy_name} strategy")
+            
+            # Initialize paper trading parameters
+            initial_balance = float(input("Enter initial balance (default: 10000): ") or "10000")
+            position_size = float(input("Enter position size % (default: 10): ") or "10") / 100
+            
+            print("\nPaper trading initialized...")
+            print(f"Initial Balance: ${initial_balance:.2f}")
+            print(f"Position Size: {position_size*100:.1f}%")
+            
+            # Run paper trading simulation
+            try:
+                paper_trading_results = run_paper_trading(
+                    symbol, timeframe, 
+                    strategy=strategy_name,
+                    signal_column=active_signal,
+                    initial_balance=initial_balance,
+                    position_size=position_size,
+                    rl_agent=rl_agent if use_rl and 'rl_agent' in locals() else None
+                )
+                
+                print("\nPaper trading completed")
+                logging.info("Paper trading completed")
+                
+            except KeyboardInterrupt:
+                print("\nPaper trading stopped by user")
+                logging.info("Paper trading stopped by user")
+            except Exception as e:
+                print(f"\nError during paper trading: {str(e)}")
+                logging.error(f"Paper trading error: {str(e)}")
+                traceback.print_exc()
+            
+        elif mode == "3":
+            # Live trading mode
+            print("\n" + "="*60)
+            print("  LIVE TRADING MODE")
+            print("="*60)
+            
+            # Security confirmation
+            print("\n⚠️ WARNING: You are about to start LIVE TRADING with REAL MONEY ⚠️")
+            confirm = input("\nType 'CONFIRM' to proceed with live trading: ")
+            
+            if confirm != "CONFIRM":
+                print("Live trading canceled")
+                logging.info("Live trading canceled by user")
+                return market_data
+            
+            print(f"\nInitializing live trading with {strategy_name} strategy...")
+            logging.info(f"Live trading initialized with {strategy_name} strategy")
+            
+            # Live trading parameters
+            trade_amount = input("Enter trade quantity (or press Enter to use position sizing): ")
+            trade_amount = float(trade_amount) if trade_amount else None
+            
+            # Run live trading
+            try:
+                live_trading_results = run_live_trading(
+                    symbol, timeframe,
+                    strategy=strategy_name,
+                    signal_column=active_signal,
+                    quantity=trade_amount,
+                    rl_agent=rl_agent if use_rl and 'rl_agent' in locals() else None
+                )
+                
+                print("\nLive trading session completed")
+                logging.info("Live trading session completed")
+                
+            except KeyboardInterrupt:
+                print("\nLive trading stopped by user")
+                logging.info("Live trading stopped by user")
+            except Exception as e:
+                print(f"\nError during live trading: {str(e)}")
+                logging.error(f"Live trading error: {str(e)}")
+                traceback.print_exc()
+        
+        print("\n" + "="*60)
+        print("  TRADING SYSTEM EXECUTION COMPLETED")
+        print("="*60)
+        
+        # Return processed market data for further analysis
+        return market_data
+        
     except Exception as e:
-        logger.critical(f"Unhandled exception: {e}")
-        logger.critical(traceback.format_exc())
-        return 1
-
+        print(f"\n===== ERROR =====")
+        print(f"An error occurred: {str(e)}")
+        print("\nDetailed traceback:")
+        traceback.print_exc()
+        logging.error(f"Error in main: {str(e)}", exc_info=True)
+        return None
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as e:
-        logger.critical(f"Unhandled exception: {e}")
-        logger.critical(traceback.format_exc())
-        sys.exit(1)
+    # Your existing code to load/process data and run strategy
+    
+    # After your main strategy runs, integrate RL:
+    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
+    
+    # If you want to save the RL agent for future use
+    if rl_agent is not None:
+        try:
+            rl_agent.save("production_rl_agent.h5")
+            print("Saved production RL agent model")
+        except Exception as e:
+            print(f"Error saving production model: {e}")        
+          
