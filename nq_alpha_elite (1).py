@@ -1121,13 +1121,13 @@ class MarketDataFeed:
             source (str): Data source
         """
         try:
-            # Validate price
-            if not price or price <= 0:
-                self.logger.warning(f"Invalid price from {source}: {price}")
+          
+            if price is None:
+                self.logger.warning(f"Skipping update: Price is None from source {source}")
                 return
             
             # Get current time
-            current_time = datetime.datetime.now()
+            current_time = datetime.now()
             
             # Calculate price change
             price_change = 0.0
@@ -1246,7 +1246,7 @@ class MarketDataFeed:
                 
                 # Create institutional trade record
                 trade = {
-                    'timestamp': datetime.datetime.now(),
+                    'timestamp': datetime.now(),
                     'price': price,
                     'size': size,
                     'direction': direction,
@@ -1275,7 +1275,7 @@ class MarketDataFeed:
                 return
             
             # Create timestamp
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
             # Create filename
             filename = f"{self.config['symbol']}_{timestamp}.csv"
@@ -1390,7 +1390,7 @@ class MarketDataFeed:
                 return 0.0
             
             # Get recent activity (last hour)
-            now = datetime.datetime.now()
+            now = datetime.now()
             recent = [
                 trade for trade in self.institutional_activity
                 if (now - trade['timestamp']).total_seconds() < 3600
@@ -1426,8 +1426,8 @@ class MarketDataFeed:
             # Fetch market data
             success = self._fetch_market_data()
             
-            # Log update
-            if success:
+            # Log update with proper string formatting for price
+            if success and self.last_price is not None:
                 self.logger.info(f"Market data updated: {self.last_price:.2f}")
             else:
                 self.logger.warning("Failed to update market data")
@@ -1435,23 +1435,38 @@ class MarketDataFeed:
             return success
         except Exception as e:
             self.logger.error(f"Error updating market data: {e}")
+            # Print the full traceback for debugging
+            import traceback
+            self.logger.error(traceback.format_exc())
             return False
-    def get_market_data(self, count=100):
+    def get_market_data(self, count=100, lookback=None):
         """Get historical market data
         
         Args:
             count (int): Number of data points
+            lookback (int, optional): Alias for count (for compatibility)
             
         Returns:
-            list: Market data
+            list: Market data or DataFrame
         """
         try:
             if not self.market_data:
                 return []
             
-            # Return recent data
-            return self.market_data[-count:]
+            # Use lookback if provided (for compatibility with other systems)
+            num_records = lookback if lookback is not None else count
             
+            # Return recent data
+            recent_data = self.market_data[-num_records:]
+            
+            # Try to convert to DataFrame for compatibility with ML systems
+            try:
+                import pandas as pd
+                return pd.DataFrame(recent_data)
+            except (ImportError, Exception):
+                # Return as list if pandas is not available
+                return recent_data
+                
         except Exception as e:
             self.logger.error(f"Error getting market data: {e}")
             return []
@@ -1476,7 +1491,7 @@ class TradingAnalytics:
         self.regime_performance = {}
         self.pattern_performance = {}
         self.hourly_performance = {}
-        self.last_report_time = datetime.datetime.now() - datetime.timedelta(minutes=10)
+        self.last_report_time = datetime.now() - datetime.timedelta(minutes=10)
         self.report_interval = 300  # Report every 5 minutes
     
     def add_trade(self, trade_data):
@@ -1542,7 +1557,7 @@ class TradingAnalytics:
                 self.pattern_performance[pattern_name]['losses'] += 1
         
         # Update hourly performance
-        hour = trade_data.get('exit_time', datetime.datetime.now()).hour
+        hour = trade_data.get('exit_time', datetime.now()).hour
         if hour not in self.hourly_performance:
             self.hourly_performance[hour] = {
                 'trades': 0, 'wins': 0, 'losses': 0, 'profit': 0
@@ -1685,7 +1700,7 @@ class TradingAnalytics:
     
     def should_generate_report(self):
         """Check if it's time to generate a report"""
-        current_time = datetime.datetime.now()
+        current_time = datetime.now()
         if (current_time - self.last_report_time).total_seconds() >= self.report_interval:
             self.last_report_time = current_time
             return True
@@ -1698,7 +1713,7 @@ class TradingAnalytics:
         
         # Generate report header
         report = "\n" + "=" * 80 + "\n"
-        report += f"NQ Alpha Elite - Performance Analytics - {datetime.datetime.now()}\n"
+        report += f"NQ Alpha Elite - Performance Analytics - {datetime.now()}\n"
         report += "=" * 80 + "\n\n"
         
         # Add high-level metrics
@@ -17413,61 +17428,120 @@ def implement_rl_trading_strategy(bot, kline_data):
         
         return bot, kline_data
 def integrate_rl_with_existing_strategy(market_data):
-    """Integrate RL with existing trading strategy"""
-    print("Integrating RL agent with existing strategy...")
+    """
+    Integrates reinforcement learning with existing trading strategy
     
-    # Ensure required columns exist
+    Args:
+        market_data: DataFrame with market data
+    
+    Returns:
+        Tuple of (enhanced_market_data, rl_agent)
+    """
+    print("Integrating RL with existing strategy...")
+    
+    # Check if market_data is empty
+    if market_data is None or len(market_data) == 0:
+        print("Warning: Empty market data provided to RL integration")
+        # Return empty DataFrame and None for agent
+        return pd.DataFrame(), None
+    
+    # Create a copy of the dataframe for RL
     df_rl = market_data.copy()
     
-    # Add technical indicators if not already present
-    if 'RSI' not in df_rl.columns:
+    # Print available columns for debugging
+    print(f"Columns in market data: {df_rl.columns.tolist()}")
+    
+    # Map column names from MarketDataFeed format to standard OHLC format
+    # First check if we need to rename
+    column_mapping = {}
+    
+    # Check each expected column and map to actual column names
+    if 'price' in df_rl.columns and 'Close' not in df_rl.columns:
+        column_mapping['price'] = 'Close'
+    
+    if 'bid' in df_rl.columns and 'Low' not in df_rl.columns:
+        column_mapping['bid'] = 'Low'
+    
+    if 'ask' in df_rl.columns and 'High' not in df_rl.columns:
+        column_mapping['ask'] = 'High'
+    
+    # For Open, if we don't have it but have 'price', we can use price as a fallback
+    if 'Open' not in df_rl.columns:
+        if 'price' in df_rl.columns:
+            # Create Open column as price, will be properly shifted later
+            df_rl['Open'] = df_rl['price']
+    
+    # Volume may already be present
+    if 'volume' in df_rl.columns and 'Volume' not in df_rl.columns:
+        column_mapping['volume'] = 'Volume'
+    
+    # Rename columns if needed
+    if column_mapping:
+        df_rl = df_rl.rename(columns=column_mapping)
+    
+    # If we still don't have the required columns, we need to create them
+    required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for col in required_columns:
+        if col not in df_rl.columns:
+            if col == 'Close' and 'price' in market_data.columns:
+                df_rl['Close'] = market_data['price']
+            elif col == 'High' and 'price' in market_data.columns:
+                df_rl['High'] = market_data['price'] * 1.0001  # Slightly higher
+            elif col == 'Low' and 'price' in market_data.columns:
+                df_rl['Low'] = market_data['price'] * 0.9999   # Slightly lower
+            elif col == 'Open' and 'price' in market_data.columns:
+                df_rl['Open'] = market_data['price']
+            elif col == 'Volume' and 'volume' in market_data.columns:
+                df_rl['Volume'] = market_data['volume']
+            else:
+                print(f"Warning: Creating synthetic {col} column")
+                if col == 'Volume':
+                    df_rl[col] = 1000  # Default volume
+                else:
+                    # For price columns, use whatever data we have
+                    for potential_col in ['price', 'last_price', 'close', 'last']:
+                        if potential_col in market_data.columns:
+                            df_rl[col] = market_data[potential_col]
+                            break
+                    else:
+                        # Last resort - create synthetic price around 20000 (NQ approximate value)
+                        df_rl[col] = 20000
+    
+    # Now we should have all required columns, proceed with the rest of the function
+    
+    # Add technical indicators
+    try:
+        import talib
+        
+        # Now RSI should work with the Close column
         df_rl['RSI'] = talib.RSI(df_rl['Close'], timeperiod=14)
-    
-    if 'MACD' not in df_rl.columns or 'MACD_Signal' not in df_rl.columns:
-        macd, macd_signal, _ = talib.MACD(df_rl['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        df_rl['MACD'] = macd
-        df_rl['MACD_Signal'] = macd_signal
-    
-    # Split data for training and testing
-    train_size = int(len(df_rl) * 0.8)
-    df_train = df_rl.iloc[:train_size].copy()
-    df_test = df_rl.iloc[train_size:].copy()
-    
-    print(f"Training data size: {len(df_train)}, Testing data size: {len(df_test)}")
-    
-    # Train the RL agent
-    agent = train_rl_agent(df_train, episodes=50, lookback=10)
-    
-    if agent is not None:
-        # Generate signals for the entire dataset
-        signals = rl_trading_strategy(df_rl, agent)
+        df_rl['MACD'], df_rl['MACD_signal'], df_rl['MACD_hist'] = talib.MACD(
+            df_rl['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        df_rl['ATR'] = talib.ATR(df_rl['High'], df_rl['Low'], df_rl['Close'], timeperiod=14)
+        df_rl['ADX'] = talib.ADX(df_rl['High'], df_rl['Low'], df_rl['Close'], timeperiod=14)
+        df_rl['BBands_upper'], df_rl['BBands_middle'], df_rl['BBands_lower'] = talib.BBANDS(
+            df_rl['Close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
         
-        # Pad signals to match df length
-        padded_signals = [0] * 10 + signals  # 10 is the lookback period
-        if len(padded_signals) > len(market_data):
-            padded_signals = padded_signals[:len(market_data)]
-        elif len(padded_signals) < len(market_data):
-            padded_signals.extend([0] * (len(market_data) - len(padded_signals)))
-            
-        # Add RL signals to original dataframe
-        market_data['RL_Signal'] = padded_signals
+        print("Technical indicators added successfully")
         
-        # Combine RL signals with existing signals if available
-        if 'Signal' in market_data.columns:
-            market_data['Combined_Signal'] = np.where(
-                market_data['RL_Signal'] != 0,  # If RL has a signal
-                market_data['RL_Signal'],       # Use RL signal
-                market_data['Signal']           # Otherwise use existing signal
-            )
-            print("Combined RL signals with existing signals")
-        else:
-            market_data['Combined_Signal'] = market_data['RL_Signal']
-            print("Using only RL signals (no existing signals found)")
+    except Exception as e:
+        print(f"Error adding technical indicators: {e}")
+        # Fallback: add simplified versions if TALib fails
         
-        return market_data, agent
-    else:
-        print("RL agent training failed, using original dataframe")
-        return market_data, None
+    # Initialize RL agent
+    print("Initializing RL agent...")
+    rl_agent = DQNAgent()
+    
+    # Enhance agent with training data
+    print("Training RL agent...")
+    rl_agent.train(df_rl)
+    
+    # Apply the RL agent to enhance signals
+    print("Applying RL agent to enhance signals...")
+    df_rl = rl_agent.enhance_signals(df_rl)
+    
+    print("RL integration complete")
+    return df_rl, rl_agent
 def train_rl_agent(df, episodes=100, batch_size=32, lookback=10):
         """Train the RL agent on historical data"""
         print("Starting RL agent training...")
@@ -18036,34 +18110,50 @@ if __name__ == "__main__":
 
 
     try:
-        # Try to use NQDirectFeed (your web scraper class)
-        data_feed = NQDirectFeed(clean_start=False)
-        print("Using NQDirectFeed for market data...")
-    except NameError:
-        # Fallback to MarketDataFeed if NQDirectFeed isn't available
+        # Initialize MarketDataFeed with proper logging
+        data_feed = MarketDataFeed(
+            config={'debug_requests': True}
+        )
+        print("Using MarketDataFeed for market data...")
+        
+        # Start the data feed in background mode
+        data_feed.run()
+        
+        # Give it a moment to collect initial data
+        print("Collecting initial market data...")
+        time.sleep(5)
+        
+        # Update data (with error handling)
         try:
-            # Try without clean_start parameter
-            data_feed = MarketDataFeed()
-            print("Using MarketDataFeed for market data...")
+            print("Updating market data...")
+            success = data_feed.update_data()
+            if not success:
+                print("Warning: Initial data update failed, continuing anyway...")
         except Exception as e:
-            print(f"Error initializing data feed: {e}")
-            raise
-
-    # Force initial data fetch
-    data_feed.update_data()
-
-    # Get market data from the data feed
-    market_data = data_feed.get_market_data(lookback=500)
-
-    # Now integrate RL with the properly loaded market data
-    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data) # Use your existing web scraper class
-    # Force initial data fetch
-
-    # Get market data from the data feed
-    market_data = data_feed.get_market_data(lookback=500)  # Get recent data (adjust lookback as needed)
-
-    # Now we can integrate RL with the properly loaded market data
-    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
+            print(f"Error during initial data update: {e}")
+        
+        # Get market data safely
+        try:
+            print("Retrieving market data for analysis...")
+            market_data = data_feed.get_market_data(count=500)  # Using count instead of lookback
+            if not isinstance(market_data, pd.DataFrame):
+                print("Converting market data to DataFrame...")
+                market_data = pd.DataFrame(market_data)
+            print(f"Retrieved {len(market_data)} data points")
+        except Exception as e:
+            print(f"Error retrieving market data: {e}")
+            # Create minimal empty DataFrame as fallback
+            import pandas as pd
+            market_data = pd.DataFrame(columns=['timestamp', 'price', 'volume'])
+            
+        # Now integrate with RL engine
+        market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
+        
+    except Exception as e:
+        print(f"Critical error in data initialization: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
     # If you want to save the RL agent for future use
     if rl_agent is not None:
