@@ -1416,7 +1416,26 @@ class MarketDataFeed:
         except Exception as e:
             self.logger.error(f"Error calculating institutional pressure: {e}")
             return 0.0
-    
+    def update_data(self):
+        """Update market data with latest prices
+        
+        Returns:
+            bool: Success status
+        """
+        try:
+            # Fetch market data
+            success = self._fetch_market_data()
+            
+            # Log update
+            if success:
+                self.logger.info(f"Market data updated: {self.last_price:.2f}")
+            else:
+                self.logger.warning("Failed to update market data")
+            
+            return success
+        except Exception as e:
+            self.logger.error(f"Error updating market data: {e}")
+            return False
     def get_market_data(self, count=100):
         """Get historical market data
         
@@ -18014,9 +18033,36 @@ def main():
         logging.error(f"Error in main: {str(e)}", exc_info=True)
         return None
 if __name__ == "__main__":
-    # Your existing code to load/process data and run strategy
-    
-    # After your main strategy runs, integrate RL:
+
+
+    try:
+        # Try to use NQDirectFeed (your web scraper class)
+        data_feed = NQDirectFeed(clean_start=False)
+        print("Using NQDirectFeed for market data...")
+    except NameError:
+        # Fallback to MarketDataFeed if NQDirectFeed isn't available
+        try:
+            # Try without clean_start parameter
+            data_feed = MarketDataFeed()
+            print("Using MarketDataFeed for market data...")
+        except Exception as e:
+            print(f"Error initializing data feed: {e}")
+            raise
+
+    # Force initial data fetch
+    data_feed.update_data()
+
+    # Get market data from the data feed
+    market_data = data_feed.get_market_data(lookback=500)
+
+    # Now integrate RL with the properly loaded market data
+    market_data, rl_agent = integrate_rl_with_existing_strategy(market_data) # Use your existing web scraper class
+    # Force initial data fetch
+
+    # Get market data from the data feed
+    market_data = data_feed.get_market_data(lookback=500)  # Get recent data (adjust lookback as needed)
+
+    # Now we can integrate RL with the properly loaded market data
     market_data, rl_agent = integrate_rl_with_existing_strategy(market_data)
     
     # If you want to save the RL agent for future use
